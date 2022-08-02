@@ -9,8 +9,8 @@ I assume that the dataset will look like: ```.../image/im0/1.png``` (for left im
 You will also need to create some empty directories for result saving. It should also under the root directory of Crestereo, as:<br>
 CREStereo-master:.<br>
 └───img<br>
-    ├───BEV_sigma_dbscan<br>
-    ├───dist_sigma_dbscan<br>
-    └───yolo_result<br>
+\    ├───BEV_sigma_dbscan<br>
+\    ├───dist_sigma_dbscan<br>
+\    └───yolo_result<br>
 Notice that I run this program in windows. So I use "\\" to separate directories in the code. If you run it on linux, you may need to change it.<br>
 #### Run inference
