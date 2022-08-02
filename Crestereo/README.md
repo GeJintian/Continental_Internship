@@ -12,5 +12,7 @@ CREStereo-master:.<br>
 \\\\\ ├───BEV_sigma_dbscan<br>
 \\\\\ ├───dist_sigma_dbscan<br>
 \\\\\ └───yolo_result<br>
-Notice that I run this program in windows. So I use "\\" to separate directories in the code. If you run it on linux, you may need to change it.<br>
+Notice that I run this program on windows. So I use "\\" to separate directories in the code. If you run it on linux, you may need to change it.<br>
 #### Run inference
+This is an example of running code. You can check the file for details <br>
+```python sigma_reject.py --model_path crestereo_eth3d.mge --input_dir .../image --size 720x1280 --output disparity.png --number 7```
