@@ -1,0 +1,1420 @@
+\footnotesize
+\section*{Model Architecture Code}
+\subsection*{README.md}
+\begin{lstlisting}
+#### Install
+To run this file, you should install yolov5 and Crestereo.<br>
+For yolov5, please follow: https://github.com/ultralytics/yolov5 <br>
+For Crestereo, please follow: https://github.com/megvii-research/CREStereo <br>
+Please also install packages: matplotlib, seaborn, sklearn, shutil, open3d, PIL, opencv-python <br>
+Please move sigma_reject.py to the root directory of Crestereo. You will also need to download pre-trained models.<br>
+#### Dataset
+I assume that the dataset will look like: ```.../image/im0/1.png``` (for left img) and ```.../image/im1/1.png``` (for right img). So the program will take ```--input_dir``` (which is ```.../image``` here) and ```--number``` (which is 1 here).<br>
+You will also need to create some empty directories for result saving. It should also under the root directory of Crestereo, as:<br>
+CREStereo-master:.<br>
+└───img<br>
+\\\\\ ├───BEV_sigma_dbscan<br>
+\\\\\ ├───dist_sigma_dbscan<br>
+\\\\\ └───yolo_result<br>
+Notice that I run this program on windows. So I use "\\" to separate directories in the code. If you run it on linux, you may need to change it.<br>
+#### Run inference
+This is an example of running code. You can check the file for details <br>
+```python sigma_reject.py --model_path crestereo_eth3d.mge --input_dir .../image --size 720x1280 --output disparity.png --number 7```
+\end{lstlisting}
+\subsection*{sigma_reject.py}
+\begin{lstlisting}
+import os
+import sys
+
+import megengine as mge
+import megengine.functional as F
+import argparse
+import numpy as np
+import cv2
+import open3d
+from PIL import Image, ImageDraw
+import matplotlib
+from matplotlib import pyplot as plt
+import seaborn as sns
+from nets import Model
+from sklearn.cluster import DBSCAN
+import torch
+import shutil
+import math
+
+
+def load_model(model_path):
+    """
+    Input:
+        model_path: str; path to the model of Crestereo
+    Output:
+        model: nn.model; loaded model in evaluation mode
+    """
+    print("Loading model:", os.path.abspath(model_path))
+    pretrained_dict = mge.load(model_path)
+    model = Model(max_disp=256, mixed_precision=False, test_mode=True)
+
+    model.load_state_dict(pretrained_dict["state_dict"], strict=True)
+
+    model.eval()
+    return model
+
+
+def inference(left, right, model, n_iter=20):
+    """
+    Source code from author
+    """
+    print("Model Forwarding...")
+    imgL = left.transpose(2, 0, 1)
+    imgR = right.transpose(2, 0, 1)
+    imgL = np.ascontiguousarray(imgL[None, :, :, :])
+    imgR = np.ascontiguousarray(imgR[None, :, :, :])
+
+    imgL = mge.tensor(imgL).astype("float32")
+    imgR = mge.tensor(imgR).astype("float32")
+
+    imgL_dw2 = F.nn.interpolate(
+        imgL,
+        size=(imgL.shape[2] // 2, imgL.shape[3] // 2),
+        mode="bilinear",
+        align_corners=True,
+    )
+    imgR_dw2 = F.nn.interpolate(
+        imgR,
+        size=(imgL.shape[2] // 2, imgL.shape[3] // 2),
+        mode="bilinear",
+        align_corners=True,
+    )
+    pred_flow_dw2 = model(imgL_dw2, imgR_dw2, iters=n_iter, flow_init=None)
+
+    pred_flow = model(imgL, imgR, iters=n_iter, flow_init=pred_flow_dw2)
+    pred_disp = F.squeeze(pred_flow[:, 0, :, :]).numpy()
+
+    return pred_disp
+
+def build_bev_points(x,z,result):
+    """
+    Input:
+        x: float; x coordinate in 3D
+        z: float; z coordinate in 3D
+        result: (n,2) array; contains all bev points
+    Effect:
+        Transfer a voxel in 3D coordinate system into a bev point
+    """
+    y_axis = math.floor(z/0.1)
+    #print(id1)
+    x_axis = math.floor(x/0.1)
+    result[159+x_axis][y_axis] += 1
+
+def add_bbx(point_set, is_pred = True):
+    """
+    Input:
+        point_set: (8,3) array; with the order of 
+                  5 -------- 6
+                 /|         /|
+                1 -------- 2 .
+                | |        | |
+                . 4 -------- 7
+                |/         |/
+                0 -------- 3
+        is_pred: bool; if this bouding box is predicted or ground truth (maybe helpful if you want to visualize both prediction and ground truth)
+    Output:
+        bbx: LineSet format in open3d
+    Effect:
+        This function will convert 8 corner points into lineset which open3d could draw
+    """
+    # point_set should be 8 points
+    lines = [[0, 1], [1, 2], [2, 3], [0, 3],
+            [4, 5], [5, 6], [6, 7], [4, 7],
+            [0, 4], [1, 5], [2, 6], [3, 7]]
+    if is_pred:
+        colors = [[1, 0, 0] for _ in range(len(lines))]
+    else:
+        colors = [[0, 1, 0] for _ in range(len(lines))]
+    bbx = open3d.open3d.geometry.LineSet()
+    bbx.points = open3d.open3d.utility.Vector3dVector(point_set)
+    bbx.lines = open3d.open3d.utility.Vector2iVector(lines)
+    bbx.colors = open3d.open3d.utility.Vector3dVector(colors)
+    return bbx
+
+def repeated_sigma(bbx2d, depth_map,use_repeated,use_DBSCAN,save_hist,frame,number, focal = 1000):
+    """
+    Input:
+        bbx2d: (4,2) array; 2d bbx detection result, containing (xmin,ymin,xmax,ymax)
+        depth_map: (h,w) array; depth map
+        use_repeated: bool; whether to use repeated sigma rejection
+        use_DBSCAN: bool; whether to use DBSCAN
+        save_hist: bool; whether to save depth histogram
+        frame: int; name of hist saving (frame+_+number+.png), not important if don't save hist
+        number: int; same as frame
+        focal: float; focal length of camera
+    Output:
+        bbx: LineSet format in open3d
+    Effect:
+        This function will convert 8 corner points into lineset which open3d could draw
+    """
+    xmin = bbx2d[0]
+    ymin = bbx2d[1]
+    xmax = bbx2d[2]
+    ymax = bbx2d[3]
+    # thres is the threshold to filter the flying points. Increase it if you want larger tolerance in point gap (will remain more points)
+    thres = 0.5
+    pc_list = []
+    depth_statistic = []
+
+    # You could change image size here
+    img_w = 1280
+    img_height = 720
+    # Cut off image edges
+    if ymax >= img_height:
+        ymax = ymax - 1
+    if xmax >= img_w:
+        xmax = xmax - 1
+    if ymin <=0:
+        ymin = ymin +1
+    if xmin <=0:
+        xmin = xmin + 1
+    # Convert from depth map into 3d voxels. Only consider points with depth < 200
+    for i in range(ymin,ymax):
+        for j in range(xmin,xmax):
+            if depth_map[i][j]<200:
+                if np.abs(depth_map[i][j] - depth_map[i-1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i+1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i][j-1]) < thres and np.abs(depth_map[i][j] - depth_map[i][j+1]) < thres:
+                    x = depth_map[i][j]*(j-(img_w-1)/2)/focal
+                    y = -depth_map[i][j]*(i-(img_height-1)/2)/focal
+                    z = depth_map[i][j]
+                    # filter out grounds
+                    if y>-1.2:
+                        pc_list.append([x,y,z])
+                        depth_statistic.append(depth_map[i][j])
+    depth_statistic = np.array(depth_statistic)
+    sigma = np.std(depth_statistic)
+    miu = np.mean(depth_statistic)
+
+    #repeated process
+    if use_repeated:
+        while sigma > 2:
+            pc_list = []
+            depth_stat = []
+            for i in range(ymin,ymax):
+                for j in range(xmin,xmax):
+                    if depth_map[i][j]<miu + sigma and depth_map[i][j] > miu-sigma:
+                        if np.abs(depth_map[i][j] - depth_map[i-1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i+1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i][j-1]) < thres and np.abs(depth_map[i][j] - depth_map[i][j+1]) < thres:
+                            x = depth_map[i][j]*(j-(img_w-1)/2)/focal
+                            y = -depth_map[i][j]*(i-(img_height-1)/2)/focal
+                            z = depth_map[i][j]
+                            if y>-1.2:
+                                pc_list.append([x,y,z])
+                                depth_stat.append(depth_map[i][j])
+            depth_stat = np.array(depth_stat)
+            sigma = np.std(depth_stat)
+            miu = np.mean(depth_stat)
+            depth_statistic = depth_stat
+    pc_list = np.array(pc_list)
+    zmin = miu-sigma
+    zmin_T = np.min(pc_list.T[2])
+    zmax = miu+sigma
+    #zmax = np.max(pc_list.T[2])
+    if use_DBSCAN:
+        # You can uncomment this part if you want to use sigma rejection to filter the voxels at first (not recommended. Only useful when the voxel quality is really poor). Then you need to replace pc_list with n_pc_list in the following
+        # n_pc_list = []
+        # for i in pc_list:
+        #     if i[2]>miu-sigma and i[2]<miu+sigma and i[1]>-1.3:
+        #         n_pc_list.append(i)
+        # n_pc_list = np.array(n_pc_list)
+
+        # DBSCAN setup. Increase neps if you want larger gap tolerance (might result in additional noise). minsp is the smallest number of points to be considered as a new cluster
+        neps = 0.5
+        minsp = 100
+        clustering = DBSCAN(eps=neps, min_samples = minsp).fit(pc_list)
+        counting = 0
+        num = 0
+        #print(max(clustering.labels_))
+        for i in range(np.max(clustering.labels_)+1):
+            if counting < clustering.labels_[ clustering.labels_ == i ].size:
+                counting = clustering.labels_[ clustering.labels_ == i ].size
+                num = i
+        # print("num",num)
+        # print("len",i)
+        # print("counting",counting)
+        # print(n_pc_list.shape)
+        # print(n_pc_list[clustering.labels_ == num].shape)
+        # print(n_pc_list[clustering.labels_ == num][:][2].shape)
+        # sys.exit()
+        #print(i)
+        # Find the cluster with most points. That will be our target object.
+        if max(clustering.labels_) > -1:
+            print("DBSCAN works")
+            zmin_T = np.min(pc_list[clustering.labels_ == num].T[2])
+            zmax = np.max(pc_list[clustering.labels_ == num].T[2])
+            depth_statistic = pc_list[clustering.labels_ == num].T[2]
+            sigma = np.std(depth_statistic)
+            miu = np.mean(depth_statistic)
+            pc_list = pc_list[clustering.labels_ == num]
+
+    #Plotting histgram
+    if save_hist:
+        sns.histplot(depth_statistic)
+        plt.axvline(miu,0,30000)
+        plt.axvline(miu+sigma,0,30000)
+        plt.savefig("img\\dist_sigma_dbscan\\"+str(frame)+"_"+str(number)+".png")
+        plt.cla()
+
+    #For Corner. No use anymore
+    # if depth_map[ymin][xmin]*(xmin-(img_w-1)/2)/focal > depth_map[ymax][xmin]*(xmin-(img_w-1)/2)/focal:
+    #     cxmin = depth_map[ymin][xmin]*(xmin-(img_w-1)/2)/focal
+    # else:
+    #     cxmin = depth_map[ymax][xmin]*(xmin-(img_w-1)/2)/focal
+    # if depth_map[ymax][xmin]*(ymax-(img_height-1)/2)/focal < depth_map[ymax][xmax]*(ymax-(img_height-1)/2)/focal:
+    #     cymax = depth_map[ymax][xmin]*(ymax-(img_height-1)/2)/focal
+    # else:
+    #     cymax = depth_map[ymax][xmax]*(ymax-(img_height-1)/2)/focal
+    # if depth_map[ymax][xmax]*(xmax-(img_w-1)/2)/focal <depth_map[ymin][xmax]*(xmax-(img_w-1)/2)/focal:
+    #     cxmax = depth_map[ymax][xmax]*(xmax-(img_w-1)/2)/focal
+    # else:
+    #     cxmax = depth_map[ymin][xmax]*(xmax-(img_w-1)/2)/focal
+    # if depth_map[ymin][xmin]*(ymin-(img_height-1)/2)/focal > depth_map[ymin][xmax]*(ymin-(img_height-1)/2)/focal:
+    #     cymin = depth_map[ymin][xmin]*(ymin-(img_height-1)/2)/focal
+    # else:
+    #     cymin = depth_map[ymin][xmax]*(ymin-(img_height-1)/2)/focal
+
+
+    cymin = np.min(pc_list.T[1])
+    cymax = np.max(pc_list.T[1])
+
+    cxmin = np.min(pc_list.T[0])
+    cxmax = np.max(pc_list.T[0])
+
+    line_set = [[cxmin,cymin,zmin_T],
+                [cxmin,cymax,zmin_T],
+                [cxmax,cymax,zmin_T],
+                [cxmax,cymin,zmin_T],
+                [cxmin,cymin,zmax],
+                [cxmin,cymax,zmax],
+                [cxmax,cymax,zmax],
+                [cxmax,cymin,zmax],]
+
+    # You can uncomment this part if you want to plot voxel for each object.
+    # drawlines = add_bbx(line_set)
+    # pcd = open3d.open3d.geometry.PointCloud()
+    # pcd.points = open3d.open3d.utility.Vector3dVector(pc_list)
+    # open3d.open3d.visualization.draw_geometries([pcd,drawlines])
+    bev_limit = [[159+math.floor(np.min(pc_list.T[0])/0.1),math.floor(zmax/0.1)],
+                 [159+math.floor(np.max(pc_list.T[0])/0.1),math.floor(zmax/0.1)],
+                 [159+math.floor(np.min(pc_list.T[0])/0.1),math.floor(zmin_T/0.1)],
+                 [159+math.floor(np.max(pc_list.T[0])/0.1),math.floor(zmin_T/0.1)]]
+    return miu, zmin, zmin_T,line_set,bev_limit
+
+
+
+
+if __name__=="__main__":
+    mat_backend = matplotlib.get_backend()
+    parser = argparse.ArgumentParser(description="A demo to run CREStereo.")
+    parser.add_argument(
+        "--model_path",
+        default="crestereo_eth3d.mge",
+        help="The path of pre-trained MegEngine model.",
+    )
+    parser.add_argument("--number",default = "1", help="The frame of input images")
+    parser.add_argument(
+        "--input_dir", default="img/test/", help="The path to the directory of the images."
+    )
+    parser.add_argument(
+        "--size",
+        default="1024x1536",
+        help="The image size for inference. Te default setting is 1024x1536. \
+                        To evaluate on ETH3D Benchmark, use 768x1024 instead.",
+    )
+    parser.add_argument(
+        "--output", default="disparity.png", help="The path of output disparity."
+    )
+    args = parser.parse_args()
+
+    assert os.path.exists(args.model_path), "The model path do not exist."
+
+    yolo_model = torch.hub.load('ultralytics/yolov5','yolov5m6')
+    yolo_result = yolo_model(args.input_dir+"/im0/"+args.number+".png")
+    #yolo_result.show()
+    yolo_result.save()
+    yolo_result = yolo_result.pandas().xyxy[0]
+    
+    del yolo_model
+
+    matplotlib.use(mat_backend)
+    model_func = load_model(args.model_path)
+    left = cv2.imread(args.input_dir+"/im0/"+args.number+".png")
+    right = cv2.imread(args.input_dir+"/im1/"+args.number+".png")
+
+    assert left.shape == right.shape, "The input images have inconsistent shapes."
+
+    in_h, in_w = left.shape[:2]
+
+    print("Images resized:", args.size)
+    eval_h, eval_w = [int(e) for e in args.size.split("x")]
+    left_img = cv2.resize(left, (eval_w, eval_h), interpolation=cv2.INTER_LINEAR)
+    right_img = cv2.resize(right, (eval_w, eval_h), interpolation=cv2.INTER_LINEAR)
+
+    pred = inference(left_img, right_img, model_func, n_iter=20)
+
+    t = float(in_w) / float(eval_w)
+    disp = cv2.resize(pred, (in_w, in_h), interpolation=cv2.INTER_LINEAR) * t
+    disp = np.array(disp)
+    print(disp.shape)
+    disp_vis = (disp - disp.min()) / (disp.max() - disp.min()) * 255.0
+    disp_vis = disp_vis.astype("uint8")
+    disp_vis = cv2.applyColorMap(disp_vis, cv2.COLORMAP_INFERNO)
+
+    parent_path = os.path.abspath(os.path.join(args.output, os.pardir))
+    if not os.path.exists(parent_path):
+        os.makedirs(parent_path)
+    cv2.imwrite(args.output, disp_vis)
+
+
+    # Change setup here
+    img_w = 1280
+    img_height = 720
+    fov = 90
+    focal = 1000
+    b = 1
+    depth_map = np.ones(disp.shape)
+    depth_map[:] = focal*b/(np.abs(disp[:]))
+
+    #For gt. If you want to use ground truth to replace predicted depth map, uncomment this part. gt should be in CARLA depth map format
+    # gt = cv2.imread("img\\Carla\\depth007584.png",flags = cv2.IMREAD_COLOR)
+    # gt = np.array(gt)
+    # gt = gt[:, :, :3]
+    # gt = gt[:,:,::-1]
+    # gray_depth = ((gt[:,:,0] + gt[:,:,1] * 256.0 + gt[:,:,2] * 256.0 * 256.0)/((256.0 * 256.0 * 256.0) - 1))
+    # gt = gray_depth * 1000
+    # depth_map = gt
+
+    yolo_img_path = 'runs\\detect\\exp\\'+args.number+'.jpg'
+    draw_list = []
+
+    # For whole voxels
+    # thres is the threshold to filter the flying points. Increase it if you want larger tolerance in point gap (will remain more points)
+    thres = 0.5
+    pc_list = []
+    for i in range(1,img_height-1):
+            for j in range(1,img_w-1):
+                if depth_map[i][j]<200:
+                    if np.abs(depth_map[i][j] - depth_map[i-1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i+1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i][j-1]) < thres and np.abs(depth_map[i][j] - depth_map[i][j+1]) < thres:
+                        x = depth_map[i][j]*(j-(img_w-1)/2)/focal
+                        y = -depth_map[i][j]*(i-(img_height-1)/2)/focal
+                        z = depth_map[i][j]
+                        if y>-1.2:
+                            pc_list.append([x,y,z])
+
+
+    pc_list = np.array(pc_list)
+    print(pc_list.shape)
+    pcd = open3d.open3d.geometry.PointCloud()
+    pcd.points = open3d.open3d.utility.Vector3dVector(pc_list)
+    draw_list.append(pcd)
+
+    # For coordinate axis. Uncomment this part if you want to label the center and direction of coordinate system in point clouds
+    # COR = open3d.open3d.geometry.TriangleMesh.create_coordinate_frame(size = 10, origin = [0,0,0])
+    # draw_list.append(COR)   
+    
+    # For bbx
+    img = cv2.imread(yolo_img_path)
+    bevs = np.zeros((320,500))
+    for i in pc_list:
+        if i[0]<=16 and i[0]>-16 and i[2]<50 and i[1]>-1.2:
+            build_bev_points(i[0],i[2],bevs)
+    bev_img = Image.fromarray(bevs.astype('uint8'),'L')
+    draw = ImageDraw.Draw(bev_img)   
+    for i in range(len(yolo_result)):
+        is_interest = False
+
+        # You can add more classes here as interesting class ()
+        if yolo_result["name"][i] == "car" or yolo_result["name"][i]=="person" or yolo_result["name"][i] == "truck" or yolo_result["name"][i] =="motorcycle":
+            is_interest = True
+        bbx2d = [int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i])),int(np.round_(yolo_result["xmax"][i])),int(np.round_(yolo_result["ymax"][i]))]
+        # This line generate the 3D bounding box
+        center, zmin, zmin_T,point_set,bev_corner = repeated_sigma(bbx2d,depth_map,False,True,False,args.number,i)
+        # The followings are adding texts into yolo detection results. Not important if you only want to see 3D results
+        cv2.putText(img,"AVG: %.2f" % center,(int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i]))+10),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
+        cv2.putText(img,"zmin: %.2f" % zmin,(int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i]))+25),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
+        cv2.putText(img,"true_zmin: %.2f" %zmin_T,(int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i]))+40),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
+        # Add to 3d draw_list
+        bbx3d1 = add_bbx(point_set,True)
+        draw_list.append(bbx3d1)
+        # This is for bev
+        if is_interest is True:
+            #(depth,x)
+            draw.line((bev_corner[2][1],bev_corner[2][0],bev_corner[3][1],bev_corner[3][0]),fill = 128, width = 3)
+            draw.line((bev_corner[0][1],bev_corner[0][0],bev_corner[1][1],bev_corner[1][0]),fill = 128, width = 3)
+            draw.line((bev_corner[1][1],bev_corner[1][0],bev_corner[3][1],bev_corner[3][0]),fill = 128, width = 3)
+            draw.line((bev_corner[2][1],bev_corner[2][0],bev_corner[0][1],bev_corner[0][0]),fill = 128, width = 3)
+
+    # Saving BEV
+    # resolution: 0.1; x: +-16; z: +100
+    plt.xlabel("depth")
+    plt.ylabel("baseline")
+    plt.imshow(bev_img)
+    #plt.show()
+    plt.savefig("img\\BEV_sigma_dbscan\\"+args.number+".jpg")
+
+    # Saving 2D pictures
+    #cv2.imwrite('img\\results\\'+args.number+'.jpg',img)
+
+    # Draw 3d voxels
+    print("Create voxel")
+    open3d.open3d.visualization.draw_geometries(draw_list)
+
+    # Clear yolo results
+    shutil.move(yolo_img_path,"img\\yolo_result\\"+args.number+".jpg")
+    os.rmdir("runs/detect/exp")
+
+\end{lstlisting}
+
+\section*{kitti labels visualization}
+\subsection*{bbx_visualize.py}
+\begin{lstlisting}
+import numpy as np
+import open3d
+import struct
+import os
+import math
+from PIL import Image
+from matplotlib import pyplot as plt
+from bbx import Calibration, Object3d, compute_box_3d
+
+# def voxel_construction(focal,img_height,img_w,file_name):
+#     depth_map = np.load(file_name)
+#     pc_list = []
+#     for i in range(1,img_height-1):
+#         for j in range(1,img_w-1):
+#             if depth_map[i][j]<200:
+#                 #if np.abs(depth_map[i][j] - depth_map[i-1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i+1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i][j-1]) < thres and np.abs(depth_map[i][j] - depth_map[i][j+1]) < thres:
+#                 x = depth_map[i][j]*(j-(img_w-1)/2)/focal
+#                 y = -depth_map[i][j]*(i-(img_height-1)/2)/focal
+#                 z = depth_map[i][j]
+#                 pc_list.append([x,y,z])
+#     pc_list = np.array(pc_list)
+#     #print(pc_list.shape)
+#     return pc_list
+
+def read_kitti_velodyne(path):
+    pc_list=[]
+    points = np.fromfile(path,dtype="float32").reshape((-1,4))
+    for i in range(len(points)):
+            pc_list.append([points[i][0],points[i][1],points[i][2]])
+    # print("z_max is",z_max)
+    # print("z_min is",z_min)       
+    return np.array(pc_list,dtype=np.float32)
+
+def add_bbx(point_set):
+    # point_set should be 8 points, and is_pred determines the color: True for RED, False for GREEN
+    lines = [[0, 1], [1, 2], [2, 3], [0, 3],
+            [4, 5], [5, 6], [6, 7], [4, 7],
+            [0, 4], [1, 5], [2, 6], [3, 7]]
+    #lines = [[0, 1], [1, 2], [2, 3], [0, 3]]
+    colors = [[1, 0, 0] for _ in range(len(lines))]
+    bbx = open3d.open3d.geometry.LineSet()
+    bbx.points = open3d.open3d.utility.Vector3dVector(point_set)
+    bbx.lines = open3d.open3d.utility.Vector2iVector(lines)
+    bbx.colors = open3d.open3d.utility.Vector3dVector(colors)
+    return bbx
+
+if __name__=="__main__":
+    file_name = "001875"
+    calib_file = "..\\kitti_object_detection\\data_object_calib\\training\\calib\\"+file_name+".txt"
+    calib = Calibration(calib_filepath=calib_file)
+    results_file = "disp_rcnn\\val\\"+file_name+".txt"
+    #results_file = "yolo3D\\val\\"+file_name+".txt"
+    object_list = []
+    f = open(results_file,"r")
+    line = f.readline()[:-2]
+    while(line):
+        obj = Object3d(line)
+        obj.print_object()
+        object_list.append(obj)
+        line = f.readline()[:-2]
+    #pc_list = voxel_construction(focal,img_height,img_w,file_name+".npy")
+    pc_list = read_kitti_velodyne("..\\kitti_object_detection\\velo\\training\\velodyne\\"+file_name+".bin")
+    pcd = open3d.open3d.geometry.PointCloud()
+    pcd.points = open3d.open3d.utility.Vector3dVector(pc_list)
+    draw_list = [pcd]
+    for obj in object_list:
+        _, rect_cam_point_set = compute_box_3d(obj,calib.P)
+        velo_point_set = calib.project_rect_to_velo(rect_cam_point_set)
+        bbx = add_bbx(velo_point_set)
+        draw_list.append(bbx)
+    COR = open3d.open3d.geometry.TriangleMesh.create_coordinate_frame(size = 15, origin = [0,0,0])
+    draw_list.append(COR)
+    open3d.open3d.visualization.draw_geometries(draw_list)
+\end{lstlisting}
+\subsection*{bbx.py}
+\begin{lstlisting}
+""" Helper methods for loading and parsing KITTI data.
+Author: Charles R. Qi
+Date: September 2017
+"""
+from __future__ import print_function
+
+import numpy as np
+import cv2
+import os
+
+class Object3d(object):
+    ''' 3d object label '''
+    def __init__(self, label_file_line):
+        data = label_file_line.split(' ')
+        #print(data)
+        data[1:] = [float(x) for x in data[1:]]
+
+        # extract label, truncation, occlusion
+        self.type = data[0] # 'Car', 'Pedestrian', ...
+        self.truncation = data[1] # truncated pixel ratio [0..1]
+        self.occlusion = int(data[2]) # 0=visible, 1=partly occluded, 2=fully occluded, 3=unknown
+        self.alpha = data[3] # object observation angle [-pi..pi]
+
+        # extract 2d bounding box in 0-based coordinates
+        self.xmin = data[4] # left
+        self.ymin = data[5] # top
+        self.xmax = data[6] # right
+        self.ymax = data[7] # bottom
+        self.box2d = np.array([self.xmin,self.ymin,self.xmax,self.ymax])
+        
+        # extract 3d bounding box information
+        self.h = data[8] # box height
+        self.w = data[9] # box width
+        self.l = data[10] # box length (in meters)
+        self.t = (data[11],data[12],data[13]) # location (x,y,z) in camera coord.
+        self.ry = data[14] # yaw angle (around Y-axis in camera coordinates) [-pi..pi]
+
+    def print_object(self):
+        print('Type, truncation, occlusion, alpha: %s, %d, %d, %f' % \
+            (self.type, self.truncation, self.occlusion, self.alpha))
+        print('2d bbox (x0,y0,x1,y1): %f, %f, %f, %f' % \
+            (self.xmin, self.ymin, self.xmax, self.ymax))
+        print('3d bbox h,w,l: %f, %f, %f' % \
+            (self.h, self.w, self.l))
+        print('3d bbox location, ry: (%f, %f, %f), %f' % \
+            (self.t[0],self.t[1],self.t[2],self.ry))
+
+
+class Calibration(object):
+    ''' Calibration matrices and utils
+        3d XYZ in <label>.txt are in rect camera coord.
+        2d box xy are in image2 coord
+        Points in <lidar>.bin are in Velodyne coord.
+        y_image2 = P^2_rect * x_rect
+        y_image2 = P^2_rect * R0_rect * Tr_velo_to_cam * x_velo
+        x_ref = Tr_velo_to_cam * x_velo
+        x_rect = R0_rect * x_ref
+        P^2_rect = [f^2_u,  0,      c^2_u,  -f^2_u b^2_x;
+                    0,      f^2_v,  c^2_v,  -f^2_v b^2_y;
+                    0,      0,      1,      0]
+                 = K * [1|t]
+        image2 coord:
+         ----> x-axis (u)
+        |
+        |
+        v y-axis (v)
+        velodyne coord:
+        front x, left y, up z
+        rect/ref camera coord:
+        right x, down y, front z
+        Ref (KITTI paper): http://www.cvlibs.net/publications/Geiger2013IJRR.pdf
+        TODO(rqi): do matrix multiplication only once for each projection.
+    '''
+    def __init__(self, calib_filepath, from_video=False):
+        if from_video:
+            calibs = self.read_calib_from_video(calib_filepath)
+        else:
+            calibs = self.read_calib_file(calib_filepath)
+        # Projection matrix from rect camera coord to image2 coord
+        self.P = calibs['P2'] 
+        self.P = np.reshape(self.P, [3,4])
+        # Rigid transform from Velodyne coord to reference camera coord
+        self.V2C = calibs['Tr_velo_to_cam']
+        self.V2C = np.reshape(self.V2C, [3,4])
+        self.C2V = inverse_rigid_trans(self.V2C)
+        # Rotation from reference camera coord to rect camera coord
+        self.R0 = calibs['R0_rect']
+        self.R0 = np.reshape(self.R0,[3,3])
+
+        # Camera intrinsics and extrinsics
+        self.c_u = self.P[0,2]
+        self.c_v = self.P[1,2]
+        self.f_u = self.P[0,0]
+        self.f_v = self.P[1,1]
+        self.b_x = self.P[0,3]/(-self.f_u) # relative 
+        self.b_y = self.P[1,3]/(-self.f_v)
+
+    def read_calib_file(self, filepath):
+        ''' Read in a calibration file and parse into a dictionary.
+        Ref: https://github.com/utiasSTARS/pykitti/blob/master/pykitti/utils.py
+        '''
+        data = {}
+        with open(filepath, 'r') as f:
+            for line in f.readlines():
+                line = line.rstrip()
+                if len(line)==0: continue
+                key, value = line.split(':', 1)
+                # The only non-float values in these files are dates, which
+                # we don't care about anyway
+                try:
+                    data[key] = np.array([float(x) for x in value.split()])
+                except ValueError:
+                    pass
+
+        return data
+    
+    def read_calib_from_video(self, calib_root_dir):
+        ''' Read calibration for camera 2 from video calib files.
+            there are calib_cam_to_cam and calib_velo_to_cam under the calib_root_dir
+        '''
+        data = {}
+        cam2cam = self.read_calib_file(os.path.join(calib_root_dir, 'calib_cam_to_cam.txt'))
+        velo2cam = self.read_calib_file(os.path.join(calib_root_dir, 'calib_velo_to_cam.txt'))
+        Tr_velo_to_cam = np.zeros((3,4))
+        Tr_velo_to_cam[0:3,0:3] = np.reshape(velo2cam['R'], [3,3])
+        Tr_velo_to_cam[:,3] = velo2cam['T']
+        data['Tr_velo_to_cam'] = np.reshape(Tr_velo_to_cam, [12])
+        data['R0_rect'] = cam2cam['R_rect_00']
+        data['P2'] = cam2cam['P_rect_02']
+        return data
+
+    def cart2hom(self, pts_3d):
+        ''' Input: nx3 points in Cartesian
+            Oupput: nx4 points in Homogeneous by pending 1
+        '''
+        n = pts_3d.shape[0]
+        pts_3d_hom = np.hstack((pts_3d, np.ones((n,1))))
+        return pts_3d_hom
+ 
+    # =========================== 
+    # ------- 3d to 3d ---------- 
+    # =========================== 
+    def project_velo_to_ref(self, pts_3d_velo):
+        pts_3d_velo = self.cart2hom(pts_3d_velo) # nx4
+        return np.dot(pts_3d_velo, np.transpose(self.V2C))
+
+    def project_ref_to_velo(self, pts_3d_ref):
+        pts_3d_ref = self.cart2hom(pts_3d_ref) # nx4
+        return np.dot(pts_3d_ref, np.transpose(self.C2V))
+
+    def project_rect_to_ref(self, pts_3d_rect):
+        ''' Input and Output are nx3 points '''
+        return np.transpose(np.dot(np.linalg.inv(self.R0), np.transpose(pts_3d_rect)))
+    
+    def project_ref_to_rect(self, pts_3d_ref):
+        ''' Input and Output are nx3 points '''
+        return np.transpose(np.dot(self.R0, np.transpose(pts_3d_ref)))
+ 
+    def project_rect_to_velo(self, pts_3d_rect):
+        ''' Input: nx3 points in rect camera coord.
+            Output: nx3 points in velodyne coord.
+        ''' 
+        pts_3d_ref = self.project_rect_to_ref(pts_3d_rect)
+        print(pts_3d_ref)
+        return self.project_ref_to_velo(pts_3d_ref)
+
+    def project_velo_to_rect(self, pts_3d_velo):
+        pts_3d_ref = self.project_velo_to_ref(pts_3d_velo)
+        return self.project_ref_to_rect(pts_3d_ref)
+
+    # =========================== 
+    # ------- 3d to 2d ---------- 
+    # =========================== 
+    def project_rect_to_image(self, pts_3d_rect):
+        ''' Input: nx3 points in rect camera coord.
+            Output: nx2 points in image2 coord.
+        '''
+        pts_3d_rect = self.cart2hom(pts_3d_rect)
+        pts_2d = np.dot(pts_3d_rect, np.transpose(self.P)) # nx3
+        pts_2d[:,0] /= pts_2d[:,2]
+        pts_2d[:,1] /= pts_2d[:,2]
+        return pts_2d[:,0:2]
+    
+    def project_velo_to_image(self, pts_3d_velo):
+        ''' Input: nx3 points in velodyne coord.
+            Output: nx2 points in image2 coord.
+        '''
+        pts_3d_rect = self.project_velo_to_rect(pts_3d_velo)
+        return self.project_rect_to_image(pts_3d_rect)
+
+    # =========================== 
+    # ------- 2d to 3d ---------- 
+    # =========================== 
+    def project_image_to_rect(self, uv_depth):
+        ''' Input: nx3 first two channels are uv, 3rd channel
+                   is depth in rect camera coord.
+            Output: nx3 points in rect camera coord.
+        '''
+        n = uv_depth.shape[0]
+        x = ((uv_depth[:,0]-self.c_u)*uv_depth[:,2])/self.f_u + self.b_x
+        y = ((uv_depth[:,1]-self.c_v)*uv_depth[:,2])/self.f_v + self.b_y
+        pts_3d_rect = np.zeros((n,3))
+        pts_3d_rect[:,0] = x
+        pts_3d_rect[:,1] = y
+        pts_3d_rect[:,2] = uv_depth[:,2]
+        return pts_3d_rect
+
+    def project_image_to_velo(self, uv_depth):
+        pts_3d_rect = self.project_image_to_rect(uv_depth)
+        return self.project_rect_to_velo(pts_3d_rect)
+
+ 
+def rotx(t):
+    ''' 3D Rotation about the x-axis. '''
+    c = np.cos(t)
+    s = np.sin(t)
+    return np.array([[1,  0,  0],
+                     [0,  c, -s],
+                     [0,  s,  c]])
+
+
+def roty(t):
+    ''' Rotation about the y-axis. '''
+    c = np.cos(t)
+    s = np.sin(t)
+    return np.array([[c,  0,  s],
+                     [0,  1,  0],
+                     [-s, 0,  c]])
+
+
+def rotz(t):
+    ''' Rotation about the z-axis. '''
+    c = np.cos(t)
+    s = np.sin(t)
+    return np.array([[c, -s,  0],
+                     [s,  c,  0],
+                     [0,  0,  1]])
+
+
+def transform_from_rot_trans(R, t):
+    ''' Transforation matrix from rotation matrix and translation vector. '''
+    R = R.reshape(3, 3)
+    t = t.reshape(3, 1)
+    return np.vstack((np.hstack([R, t]), [0, 0, 0, 1]))
+
+
+def inverse_rigid_trans(Tr):
+    ''' Inverse a rigid body transform matrix (3x4 as [R|t])
+        [R'|-R't; 0|1]
+    '''
+    inv_Tr = np.zeros_like(Tr) # 3x4
+    inv_Tr[0:3,0:3] = np.transpose(Tr[0:3,0:3])
+    inv_Tr[0:3,3] = np.dot(-np.transpose(Tr[0:3,0:3]), Tr[0:3,3])
+    return inv_Tr
+
+def read_label(label_filename):
+    lines = [line.rstrip() for line in open(label_filename)]
+    objects = [Object3d(line) for line in lines]
+    return objects
+
+def load_image(img_filename):
+    return cv2.imread(img_filename)
+
+def load_velo_scan(velo_filename):
+    scan = np.fromfile(velo_filename, dtype=np.float32)
+    scan = scan.reshape((-1, 4))
+    return scan
+
+def project_to_image(pts_3d, P):
+    ''' Project 3d points to image plane.
+    Usage: pts_2d = projectToImage(pts_3d, P)
+      input: pts_3d: nx3 matrix
+             P:      3x4 projection matrix
+      output: pts_2d: nx2 matrix
+      P(3x4) dot pts_3d_extended(4xn) = projected_pts_2d(3xn)
+      => normalize projected_pts_2d(2xn)
+      <=> pts_3d_extended(nx4) dot P'(4x3) = projected_pts_2d(nx3)
+          => normalize projected_pts_2d(nx2)
+    '''
+    n = pts_3d.shape[0]
+    pts_3d_extend = np.hstack((pts_3d, np.ones((n,1))))
+    print(('pts_3d_extend shape: ', pts_3d_extend.shape))
+    pts_2d = np.dot(pts_3d_extend, np.transpose(P)) # nx3
+    pts_2d[:,0] /= pts_2d[:,2]
+    pts_2d[:,1] /= pts_2d[:,2]
+    return pts_2d[:,0:2]
+
+
+def compute_box_3d(obj, P):
+    ''' Takes an object and a projection matrix (P) and projects the 3d
+        bounding box into the image plane.
+        Returns:
+            corners_2d: (8,2) array in left image coord.
+            corners_3d: (8,3) array in in rect camera coord.
+    '''
+    # compute rotational matrix around yaw axis
+    R = roty(obj.ry)    
+
+    # 3d bounding box dimensions
+    l = obj.l
+    w = obj.w
+    h = obj.h
+    
+    # 3d bounding box corners
+    x_corners = [l/2,l/2,-l/2,-l/2,l/2,l/2,-l/2,-l/2]
+    y_corners = [0,0,0,0,-h,-h,-h,-h]
+    z_corners = [w/2,-w/2,-w/2,w/2,w/2,-w/2,-w/2,w/2]
+    
+    # rotate and translate 3d bounding box
+    corners_3d = np.dot(R, np.vstack([x_corners,y_corners,z_corners]))
+    #print corners_3d.shape
+    corners_3d[0,:] = corners_3d[0,:] + obj.t[0]
+    corners_3d[1,:] = corners_3d[1,:] + obj.t[1]
+    corners_3d[2,:] = corners_3d[2,:] + obj.t[2]
+    #print 'cornsers_3d: ', corners_3d 
+    # only draw 3d bounding box for objs in front of the camera
+    if np.any(corners_3d[2,:]<0.1):
+        corners_2d = None
+        return corners_2d, np.transpose(corners_3d)
+    
+    # project the 3d bounding box into the image plane
+    corners_2d = project_to_image(np.transpose(corners_3d), P)
+    #print 'corners_2d: ', corners_2d
+    return corners_2d, np.transpose(corners_3d)
+
+
+def compute_orientation_3d(obj, P):
+    ''' Takes an object and a projection matrix (P) and projects the 3d
+        object orientation vector into the image plane.
+        Returns:
+            orientation_2d: (2,2) array in left image coord.
+            orientation_3d: (2,3) array in in rect camera coord.
+    '''
+    
+    # compute rotational matrix around yaw axis
+    R = roty(obj.ry)
+   
+    # orientation in object coordinate system
+    orientation_3d = np.array([[0.0, obj.l],[0,0],[0,0]])
+    
+    # rotate and translate in camera coordinate system, project in image
+    orientation_3d = np.dot(R, orientation_3d)
+    orientation_3d[0,:] = orientation_3d[0,:] + obj.t[0]
+    orientation_3d[1,:] = orientation_3d[1,:] + obj.t[1]
+    orientation_3d[2,:] = orientation_3d[2,:] + obj.t[2]
+    
+    # vector behind image plane?
+    if np.any(orientation_3d[2,:]<0.1):
+      orientation_2d = None
+      return orientation_2d, np.transpose(orientation_3d)
+    
+    # project orientation into the image plane
+    orientation_2d = project_to_image(np.transpose(orientation_3d), P);
+    return orientation_2d, np.transpose(orientation_3d)
+
+def draw_projected_box3d(image, qs, color=(255,255,255), thickness=2):
+    ''' Draw 3d bounding box in image
+        qs: (8,3) array of vertices for the 3d box in following order:
+            1 -------- 0
+           /|         /|
+          2 -------- 3 .
+          | |        | |
+          . 5 -------- 4
+          |/         |/
+          6 -------- 7
+    '''
+    qs = qs.astype(np.int32)
+    for k in range(0,4):
+       # Ref: http://docs.enthought.com/mayavi/mayavi/auto/mlab_helper_functions.html
+       i,j=k,(k+1)%4
+       # use LINE_AA for opencv3
+       cv2.line(image, (qs[i,0],qs[i,1]), (qs[j,0],qs[j,1]), color, thickness, cv2.CV_AA)
+
+       i,j=k+4,(k+1)%4 + 4
+       cv2.line(image, (qs[i,0],qs[i,1]), (qs[j,0],qs[j,1]), color, thickness, cv2.CV_AA)
+
+       i,j=k,k+4
+       cv2.line(image, (qs[i,0],qs[i,1]), (qs[j,0],qs[j,1]), color, thickness, cv2.CV_AA)
+    return image
+\end{lstlisting}
+\section*{Experiment Code}
+\subsection*{Notice}
+This part of code is not important. They are just test codes used in my experiment. Using the main code above you can repeat my work. I provide these codes just for your reference. These codes are not carefully annotated, and some old experiments (like forward-backward consistency checking) are commented out. You will need to read through those codes if you want to repeat them.
+\subsection*{Crestereo_voxel.py}
+\begin{lstlisting}
+import os
+import math
+import megengine as mge
+import megengine.functional as F
+import argparse
+import numpy as np
+import cv2
+import open3d
+from PIL import Image
+from matplotlib import pyplot as plt
+from torch import arctan
+from nets import Model
+
+
+def load_model(model_path):
+    print("Loading model:", os.path.abspath(model_path))
+    pretrained_dict = mge.load(model_path)
+    model = Model(max_disp=256, mixed_precision=False, test_mode=True)
+
+    model.load_state_dict(pretrained_dict["state_dict"], strict=True)
+
+    model.eval()
+    return model
+
+
+def inference(left, right, model, n_iter=20):
+    print("Model Forwarding...")
+    imgL = left.transpose(2, 0, 1)
+    imgR = right.transpose(2, 0, 1)
+    imgL = np.ascontiguousarray(imgL[None, :, :, :])
+    imgR = np.ascontiguousarray(imgR[None, :, :, :])
+
+    imgL = mge.tensor(imgL).astype("float32")
+    imgR = mge.tensor(imgR).astype("float32")
+
+    imgL_dw2 = F.nn.interpolate(
+        imgL,
+        size=(imgL.shape[2] // 2, imgL.shape[3] // 2),
+        mode="bilinear",
+        align_corners=True,
+    )
+    imgR_dw2 = F.nn.interpolate(
+        imgR,
+        size=(imgL.shape[2] // 2, imgL.shape[3] // 2),
+        mode="bilinear",
+        align_corners=True,
+    )
+    pred_flow_dw2 = model(imgL_dw2, imgR_dw2, iters=n_iter, flow_init=None)
+
+    pred_flow = model(imgL, imgR, iters=n_iter, flow_init=pred_flow_dw2)
+    pred_disp = F.squeeze(pred_flow[:, 0, :, :]).numpy()
+
+    return pred_disp
+
+def get_transform(cx,cz,rotate):
+    theta = math.arctan(cx,cz)
+    alpha = rotate - theta
+    x = math.sqrt(cx*cx+cz*cz)*math.cos(alpha)
+    z = math.sqrt(cx*cx+cz*cz)*math.sin(alpha)
+    return x,z
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="A demo to run CREStereo.")
+    parser.add_argument(
+        "--model_path",
+        default="crestereo_eth3d.mge",
+        help="The path of pre-trained MegEngine model.",
+    )
+    parser.add_argument(
+        "--left", default="img/test/left.png", help="The path of left image."
+    )
+    parser.add_argument(
+        "--right", default="img/test/right.png", help="The path of right image."
+    )
+    parser.add_argument(
+        "--size",
+        default="1024x1536",
+        help="The image size for inference. Te default setting is 1024x1536. \
+                        To evaluate on ETH3D Benchmark, use 768x1024 instead.",
+    )
+    parser.add_argument(
+        "--output", default="disparity.png", help="The path of output disparity."
+    )
+    args = parser.parse_args()
+
+    model_func = load_model(args.model_path)
+    left = cv2.imread("D:\\Weeks\\CREStereo-master\\CREStereo-master\\img\\Carla\\im0.png")
+    right = cv2.imread("D:\\Weeks\\CREStereo-master\\CREStereo-master\\img\\Carla\\im1.png")
+
+    assert left.shape == right.shape, "The input images have inconsistent shapes."
+
+    in_h, in_w = left.shape[:2]
+
+    print("Images resized:", args.size)
+    eval_h, eval_w = [int(e) for e in args.size.split("x")]
+    left_img = cv2.resize(left, (eval_w, eval_h), interpolation=cv2.INTER_LINEAR)
+    right_img = cv2.resize(right, (eval_w, eval_h), interpolation=cv2.INTER_LINEAR)
+
+    pred = inference(left_img, right_img, model_func, n_iter=20)
+
+    t = float(in_w) / float(eval_w)
+    disp = cv2.resize(pred, (in_w, in_h), interpolation=cv2.INTER_LINEAR) * t
+    disp_left = np.array(disp)
+    print(disp.shape)
+    disp_vis = (disp - disp.min()) / (disp.max() - disp.min()) * 255.0
+    disp_vis = disp_vis.astype("uint8")
+    disp_vis = cv2.applyColorMap(disp_vis, cv2.COLORMAP_INFERNO)
+
+    parent_path = os.path.abspath(os.path.join(args.output, os.pardir))
+    if not os.path.exists(parent_path):
+        os.makedirs(parent_path)
+    cv2.imwrite(args.output, disp_vis)
+
+    # Forward-Backward consistency
+    # left_flip = np.zeros(left.shape)
+    # for i in range(720):
+    #     for j in range(1280):
+    #         for k in range(3):
+    #             left_flip[i][1279-j][k] = left[i][j][k]
+    # right_flip = np.zeros(right.shape)
+    # for i in range(720):
+    #     for j in range(1280):
+    #         for k in range(3):
+    #             right_flip[i][1279-j][k] = right[i][j][k]
+
+    # left_img = cv2.resize(left_flip, (eval_w, eval_h), interpolation=cv2.INTER_LINEAR)
+    # right_img = cv2.resize(right_flip, (eval_w, eval_h), interpolation=cv2.INTER_LINEAR)
+    # img = Image.fromarray(right_flip.astype('uint8'))
+    # plt.title("flipped right image")
+    # plt.imshow(img)
+    # plt.show()
+    # # img = Image.fromarray(left_flip.astype('uint8'))
+    # # plt.imshow(img)
+    # # plt.show()
+    # pred = inference(right_img, left_img, model_func, n_iter=20)
+
+    # t = float(in_w) / float(eval_w)
+    # disp_flip = cv2.resize(pred, (in_w, in_h), interpolation=cv2.INTER_LINEAR) * t
+    # disp_flip = np.array(disp_flip)
+    # # change back
+    # disp_right = np.zeros(disp_flip.shape)
+    # for i in range(720):
+    #     for j in range(1280):
+    #             disp_right[i][1279-j] = -disp_flip[i][j]
+    #print(disp.shape)
+
+    # left = cv2.imread("img\\Carlap\\im0\\12.png",cv2.IMREAD_GRAYSCALE)
+    # right = cv2.imread("img\\Carlap\\im1\\12.png",cv2.IMREAD_GRAYSCALE)
+    # wsize = 31
+    # max_disp = 128
+    # sigma = 1.5
+    # lmbda = 8000
+    # left_matcher = cv2.StereoBM_create(max_disp,wsize)
+    # right_matcher = cv2.ximgproc.createRightMatcher(left_matcher)
+    # left_disp = left_matcher.compute(left,right)
+    # right_disp = right_matcher.compute(right,left)
+    # wls_filter = cv2.ximgproc.createDisparityWLSFilter(left_matcher)
+    # wls_filter.setLambda(lmbda)
+    # wls_filter.setSigmaColor(sigma)
+    # filtered_disp = wls_filter.filter(left_disp,left,disparity_map_right=right_disp)
+    # disp = np.array(filtered_disp)
+    print(np.max(disp_left),np.min(disp_left))
+    #For carla voxel
+    img_w = 1280
+    img_height = 720
+    fov = 90
+    focal = 1000
+    b = 1.6
+    img = Image.fromarray(disp_left.astype('uint8'),'L')
+    plt.title("disparity by crestereo")
+    plt.imshow(img)
+    plt.show()
+    depth_map = np.ones(disp_left.shape)
+    depth_map[:] = focal*b/(np.abs(disp_left[:]))
+    img = Image.fromarray(depth_map.astype('uint8'),'L')
+    plt.title("depth_map by crestereo")
+    plt.imshow(img)
+    plt.show()
+    thres = 0.5
+    #Validation
+    # gt = cv2.imread("img\\Carla\\depth007584.png",flags = cv2.IMREAD_COLOR)
+    # gt = np.array(gt)
+    # gt = gt[:, :, :3]
+    # gt = gt[:,:,::-1]
+    # gray_depth = ((gt[:,:,0] + gt[:,:,1] * 256.0 + gt[:,:,2] * 256.0 * 256.0)/((256.0 * 256.0 * 256.0) - 1))
+    # gt = gray_depth * 1000
+    # img = Image.fromarray(gt.astype('uint8'),'L')
+    # plt.title("ground truth from carla")
+    # plt.imshow(img)
+    # plt.show()
+    # difference = np.zeros(depth_map.shape)
+    # count = 0
+    # counting = 0
+    # for i in range(1,img_height-1):
+    #     for j in range(1,img_w-1):
+    #         if (depth_map[i][j] - depth_map[i-1][j] < thres and depth_map[i][j] - depth_map[i+1][j] < thres and depth_map[i][j] - depth_map[i][j-1] < thres and depth_map[i][j] - depth_map[i][j+1] < thres) and depth_map[i][j]<200 and gt[i][j]<200:
+    #             difference[i][j] = np.abs(depth_map[i][j] - gt[i][j])
+    #             if difference[i][j] > 1:
+    #                 counting = counting+1
+    #             count = count + 1
+    # print("rmse are ",np.sqrt((difference*difference).sum()/count))
+    # print(count)
+    # print(counting)
+    # img = Image.fromarray(difference.astype('uint8'),'L')
+    # plt.imshow(img)
+    # plt.show()
+    # gt_point=[]
+    # pred_point = []
+    # for i in range(1,img_height-1):
+    #     for j in range(1,img_w-1):
+    #         if gt[i][j]<200:
+    #             if depth_map[i][j]<200:
+    #                 if depth_map[i][j] - depth_map[i-1][j] < thres and depth_map[i][j] - depth_map[i+1][j] < thres and depth_map[i][j] - depth_map[i][j-1] < thres and depth_map[i][j] - depth_map[i][j+1] < thres:
+    #                     gt_point.append(gt[i][j])
+    #                     pred_point.append(depth_map[i][j])
+    # print(len(gt_point))
+    # plt.scatter(np.array(gt_point),np.array(pred_point))
+    # plt.xlabel("gt")
+    # plt.ylabel("prediction")
+    # plt.plot()
+    # plt.show()
+
+
+    #Voxel
+    pc_list = []
+    for i in range(1,img_height-1):
+        for j in range(1,img_w-1):
+            if depth_map[i][j]<200:
+                if np.abs(depth_map[i][j] - depth_map[i-1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i+1][j]) < thres and np.abs(depth_map[i][j] - depth_map[i][j-1]) < thres and np.abs(depth_map[i][j] - depth_map[i][j+1]) < thres:
+                    x = depth_map[i][j]*(j-600)/focal
+                    y = depth_map[i][j]*(i-182)/focal
+                    z = depth_map[i][j]
+                    pc_list.append([x,y,z])
+                # if round(j+disp_left[i][j])>=0 and round(j+disp_left[i][j])<=1279:
+                #     if np.abs(disp_left[i][j]+disp_right[i][round(j+disp_left[i][j])])<=5:
+                #         x = depth_map[i][j]*j/focal
+                #         y = depth_map[i][j]*i/focal
+                #         z = depth_map[i][j]
+                #         pc_list.append([x,y,z])
+                # else:
+                #     if depth_map[i][j] - depth_map[i-1][j] < thres and depth_map[i][j] - depth_map[i+1][j] < thres and depth_map[i][j] - depth_map[i][j-1] < thres and depth_map[i][j] - depth_map[i][j+1] < thres:
+                #         x = depth_map[i][j]*j/focal
+                #         y = depth_map[i][j]*i/focal
+                #         z = depth_map[i][j]
+                #         pc_list.append([x,y,z])
+            # x = gt[i][j]*j/focal
+            # y = gt[i][j]*i/focal
+            # z = gt[i][j]
+            # pc_list.append([x,y,z])
+    pc_list = np.array(pc_list)
+    print(pc_list.shape)
+    pcd = open3d.open3d.geometry.PointCloud()
+    pcd.points = open3d.open3d.utility.Vector3dVector(pc_list)
+    COR = open3d.open3d.geometry.TriangleMesh.create_coordinate_frame(size = 15, origin = [0,0,0])
+    open3d.open3d.visualization.draw_geometries([pcd,])
+
+
+\end{lstlisting}
+\subsection*{test_middlebury.ipynb}
+\begin{lstlisting}
+from __future__ import print_function, division
+import sys
+sys.path.append('core')
+
+import argparse
+import time
+import logging
+import numpy as np
+import torch
+from tqdm import tqdm
+from raft_stereo import RAFTStereo, autocast
+import stereo_datasets as datasets
+from utils.utils import InputPadder
+from PIL import Image
+from matplotlib import pyplot as plt
+import copy
+
+class test_args():
+    def __init__(self):
+        self.restore_ckpt = "raftstereo-middlebury.pth"
+        self.dataset = "middlebury_Q"
+        self.mixed_precision = False
+        self.valid_iters = 32
+        self.hidden_dims = [128]*3
+        self.corr_implementation = "alt"
+        self.shared_backbone = False
+        self.corr_levels = 4
+        self.corr_radius = 4
+        self.n_downsample = 2
+        self.slow_fast_gru = False
+        self.n_gru_layers = 3
+
+args = test_args()
+model = torch.nn.DataParallel(RAFTStereo(args), device_ids=[0])
+print(args.restore_ckpt)
+if args.restore_ckpt is not None:
+    assert args.restore_ckpt.endswith(".pth")
+    print("Loading checkpoint...")
+    checkpoint = torch.load(args.restore_ckpt)
+    model.load_state_dict(checkpoint, strict=True)
+    print(f"Done loading checkpoint")
+model.cuda()
+model.eval()
+@torch.no_grad()
+def validate_middlebury(model, iters=32, split='Q', mixed_prec=False):
+    """ Peform validation using the Middlebury-V3 dataset """
+    model.eval()
+    aug_params = {}
+    val_dataset = datasets.Middlebury(aug_params, split=split)
+
+    out_list, epe_list = [], []
+    val_id = 0
+    (imageL_file, _, _), image1_t, image2_t, flow_gt, valid_gt = val_dataset[val_id]
+    #x = image1.permute((1,2,0)).numpy()
+    #print(np.array(x))
+    #img = Image.fromarray(x.astype('uint8'))
+    #plt.imshow(x)
+    #plt.show()
+    image1 = image1_t[None].cuda()
+    image2 = image2_t[None].cuda()
+
+    padder = InputPadder(image1.shape, divis_by=32)
+    image1, image2 = padder.pad(image1, image2)
+
+
+    with autocast(enabled=mixed_prec):
+        _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
+    #flow_pr = padder.unpad(flow_pr).cpu().squeeze(0)
+    print("Shape of ground truth is ",valid_gt.shape)
+    #img = Image.fromarray(flow_gt[0].cpu().numpy().astype('uint8'),'L')
+    #print(img.mode)
+
+    flow_pr = padder.unpad(flow_pr)
+    print("Shape of model prediction is ",flow_pr.shape)
+    img = Image.fromarray(np.abs(flow_pr[0][0].cpu().numpy()).astype('uint8'),'L')
+    print(img.mode)
+    plt.imshow(img)
+    plt.show()
+    return flow_gt, flow_pr.cpu()
+    #assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
+result = validate_middlebury(model)
+pred = result[1][0]
+print(pred)
+#print(result[0][0])
+pred = pred.numpy()[0]
+img = Image.fromarray(np.abs(pred).astype('uint8'),'L')
+plt.imshow(img)
+plt.title("disparity")
+plt.show()
+img_w = 707
+img_height = 481
+fov = 90
+focal = 1000
+b = 1.6
+depth_map = np.ones(pred.shape)
+depth_map[:] = focal*b/(np.abs(pred[:]))
+#print(depth_map.max())
+#print(depth_map.shape)
+img = Image.fromarray(depth_map.astype('uint8'),'L')
+plt.imshow(img)
+plt.title("depth_map")
+plt.show()
+# Filtering large gradient
+thres = 1
+filtered_map = copy.deepcopy(depth_map)
+for i in range(1,480):
+    for j in range(1,706):
+        if (depth_map[i][j] - depth_map[i-1][j] > thres or depth_map[i][j] - depth_map[i+1][j] > thres or depth_map[i][j] - depth_map[i][j-1] > thres or depth_map[i][j] - depth_map[i][j+1] > thres) and depth_map[i][j]<1000:
+            filtered_map[i][j]=0
+img = Image.fromarray(filtered_map.astype('uint8'),'L')
+plt.imshow(img)
+plt.show()
+
+#from utils.utils import bilinear_sampler
+#bilinear_depth_map = bilinear_sampler
+pc_list = []
+for i in range(1,480):
+    for j in range(1,706):
+        if depth_map[i][j]<1000:
+            if depth_map[i][j] - depth_map[i-1][j] < thres and depth_map[i][j] - depth_map[i+1][j] < thres and depth_map[i][j] - depth_map[i][j-1] < thres and depth_map[i][j] - depth_map[i][j+1] < thres:
+                x = depth_map[i][j]*j/focal
+                y = depth_map[i][j]*i/focal
+                z = depth_map[i][j]
+                pc_list.append([x,y,z])
+pc_list = np.array(pc_list)
+print(pc_list.shape)
+pc_list
+
+#from utils.utils import bilinear_sampler
+#bilinear_depth_map = bilinear_sampler
+pc_list = []
+for i in range(481):
+    for j in range(707):
+        if depth_map[i][j]<1000:
+            x = depth_map[i][j]*j/focal
+            y = depth_map[i][j]*i/focal
+            z = depth_map[i][j]
+            pc_list.append([x,y,z])
+pc_list = np.array(pc_list)
+print(pc_list.shape)
+pc_list
+
+from PIL import Image
+import cv2
+gt = cv2.imread("D:\\Weeks\\ai_stereo\\RAFT-Stereo-main\\datasets\\Middlebury\\MiddEval3\\trainingQ\\Carla\\depth004788.png",flags = cv2.IMREAD_COLOR)
+#gt.show()
+gt = np.array(gt)
+#img = Image.fromarray(gt.astype('uint8'),'L')
+#plt.imshow(img)
+#plt.show()
+gt = gt[:, :, :3]
+gt = gt[:,:,::-1]
+gray_depth = ((gt[:,:,0] + gt[:,:,1] * 256.0 + gt[:,:,2] * 256.0 * 256.0)/((256.0 * 256.0 * 256.0) - 1))
+gt = gray_depth * 1000
+
+img = Image.fromarray(gt.astype('uint8'),'L')
+plt.title("ground truth from carla")
+plt.imshow(img)
+plt.show()
+
+img = Image.fromarray(depth_map.astype('uint8'),'L')
+plt.title("depth map from raft")
+plt.imshow(img)
+plt.show()
+#print(gt)
+difference = np.zeros(depth_map.shape)
+count = 0
+counting = 0
+for i in range(1,480):
+    for j in range(1,706):
+        if (depth_map[i][j] - depth_map[i-1][j] < thres and depth_map[i][j] - depth_map[i+1][j] < thres and depth_map[i][j] - depth_map[i][j-1] < thres and depth_map[i][j] - depth_map[i][j+1] < thres) and depth_map[i][j]<1000:
+            difference[i][j] = np.abs(depth_map[i][j] - gt[i][j])
+            if difference[i][j] > 1:
+                counting = counting+1
+            count = count + 1
+print("rmse are ",np.sqrt((difference*difference).sum()/count))
+print(count)
+print(counting)
+img = Image.fromarray(difference.astype('uint8'),'L')
+plt.imshow(img)
+plt.show()
+
+
+x_axis = np.reshape(gt,481*707)
+y_axis = np.reshape(depth_map,481*707)
+plt.scatter(x_axis,y_axis)
+plt.xlabel("gt")
+plt.ylabel("prediction")
+plt.plot()
+
+thres = 0.5
+gt_point=[]
+pred_point = []
+for i in range(1,480):
+    for j in range(1,706):
+        if gt[i][j]<999:
+            if depth_map[i][j]<1000:
+                if depth_map[i][j] - depth_map[i-1][j] < thres and depth_map[i][j] - depth_map[i+1][j] < thres and depth_map[i][j] - depth_map[i][j-1] < thres and depth_map[i][j] - depth_map[i][j+1] < thres:
+                    gt_point.append(gt[i][j])
+                    pred_point.append(depth_map[i][j])
+print(len(gt_point))
+plt.scatter(np.array(gt_point),np.array(pred_point))
+plt.xlabel("gt")
+plt.ylabel("prediction")
+plt.plot()
+
+
+pc_list = []
+for i in range(481):
+    for j in range(707):
+        if gt[i][j]<400:
+            x = gt[i][j]*j/focal
+            y = gt[i][j]*i/focal
+            z = gt[i][j]
+            pc_list.append([x,y,z])
+pc_list = np.array(pc_list)
+print(pc_list.shape)
+pc_list
+
+import open3d
+pcd = open3d.open3d.geometry.PointCloud()
+pcd.points = open3d.open3d.utility.Vector3dVector(pc_list)
+open3d.open3d.visualization.draw_geometries([pcd])
+\end{lstlisting}

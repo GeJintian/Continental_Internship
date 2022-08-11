@@ -1,0 +1,596 @@
+
+\documentclass[12pt]{article}
+\usepackage{indentfirst}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{rotating}
+\usepackage{color}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{amsmath}
+\usepackage{multirow}
+\usepackage{enumerate}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{cite}
+\usepackage{wrapfig}
+\usepackage{graphicx}
+\usepackage{multimedia}
+\usepackage{bookmark}
+\usepackage{tikz}
+\usepackage{textcomp}
+\usepackage{longtable}
+
+\setlength{\parskip}{0.5em}
+
+\lstset{
+  breaklines,
+  columns=flexible,
+}
+\date{August 2022}
+\title{AI STEREO CAMERA REPORT}
+\author{Ge Jintian}
+\begin{document}
+\begin{titlepage}
+  \centering
+
+  \hrulefill\par~\\
+  \begin{large}
+   \sc{Continental Internship Report\\}
+  \end{large}
+  \hrulefill\\
+  \vspace{4cm}
+  \Large \sc{AI Stereo Camera Report}\\~\\
+
+  \small
+  \vspace{10cm}
+  \begin{tabular}{l l}
+    Ge Jintian & jintian.ge@continental-corporation.com
+  \end{tabular}
+\vfill
+  Date: {\today}
+\end{titlepage}
+\newpage
+\setcounter{tocdepth}{2}
+\tableofcontents
+\pagebreak
+\section{Abstract}
+Only recently it has become possible to recreate a visual tract to navigate the world using optical flow. 4D and 3D neural networks play a key role here. This is how we humans work, but also every bee and bumblebee. The optic nerves cross behind the eyes. We think in four dimensions in this crossing, because in general 2D x 2D experience = 4D experience. 
+
+Until now, people have only been able to formulate algorithms for cases in which cameras are aligned with each other. In stereo cases, if one of the camera is rotated for some degrees, classic algorithm will give some inaccurate depth prediction. However, by using some deep learning algorithms, we can translate the 4D experience into disparity. Such a deep learning algorithm (such as RAFT), will have a great tolerance on the rotation of camera.
+
+The first part of my work will be based on the disparity prediction algorithm and try to predict distance and labels. This is very closed to 3D object detection task, except that it doesn't predict orientation. The second part, however, will consider the orientation as a necessary work. So in the second part, I will look into several algorithms, explain their architecture and list the necessary setup for their training.
+
+
+
+\textbf{Keywords:} Stereo Camera, 3D Object Detection, 
+
+\section{Introduction}
+Generally speaking, stereo-based 3d object detection algorithm will take two images as input. These two images should come from two parallel cameras. Then, it will output bounding boxes of interesting objects like vehicles or pedestrians. Concretely, there are three kinds of common models: the first kind model is often called pseudo LiDAR. Another model is more straight forward. It is a kind of multi-task learning, which will predict both 3D detection result as well as the depth map. And recently there are many people working on the idea of “detection first, instance-level voxels second”, such as Tesla. 
+\subsection{Pseudo LiDAR}
+The first kind of model focus on building an similar environment to LiDAR 3D Object Detection. Fig.~\ref{intro1} has shown the basic architecture. This kind of model will predict a disparity map and construct Pseudo LiDAR voxels. Then, use LiDAR-based 3D object detection algorithm to predict 3D bounding box. It is always a 2 stage algorithm, but one recent paper\cite{DBLP:journals/corr/abs-2004-03080} propose a method to back-propagate loss from voxels to disparity, making it possible to become end-to-end. 
+
+The advantage of this kind of model is that it can apply some SOTA (State Of The Art) algorithms in LiDAR 3D object detection field directly. However, the quality of Pseudo LiDAR voxels might not be as accurate as the true LiDAR points, which will affect the final results heavily.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.4\textwidth]{intro1.png}
+    \caption{Pseudo LiDAR based detection}
+    \label{intro1}
+\end{figure}
+\subsection{Depth Loss based Detection}
+The second kind of model is a one-stage algorithm which is quite similar to multi-task learning. Generally, it could be considered as a multi-task model with two output heads. The first head will output depth and the second head will output bounding box. The different is that the second head will base on the result of first head. Sometimes the output of first head will be concatenate with some feature maps (maybe output of cost volume), while some other algorithms might use the output of first head as input of second head directly, as shown in fig.~\ref{intro2}. In training, both the depth output layer and the 3D detection layer will be trained. Namely, the depth ground truth will be used in the loss function. In that case, the first half part of the network will be trained by the loss propagation from both depth and 3D bounding box.
+
+The advantage of the this kind of model is that it is convenient to train it. It is a one-stage algorithm, and you could get some straight forward intermediate results like the depth map. But such a network has less tolerance. The depth prediction is related to camera instinct matrix, so if you change the instinct matrix, you will need to train the network again with new depth ground truth.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.5\textwidth]{intro2.png}
+    \caption{Depth prediction based detection}
+    \label{intro2}
+\end{figure}
+\subsection{Instance-level based Detection}
+The third kind of algorithm is popular in recent years. Such kind of algorithm will use 2D detector to predict bounding box (or mask) first. Then, based on the 2D detection result, it will compute disparity for the instance. After that, the disparity will be converted into instance-level voxels and a 3d detector will be used to predict 3D bounding box. This is often a two-stage or three-stage algorithm. The whole architecture is presented in fig.~\ref{intro3}.
+
+The advantage of this algorithm is less computation resources demands. In stereo based 3D detection, the most time is consumed in computing the disparity (or depth) map. This is because that the process which generates disparity (depth) map requires computing cost volume (will be introduced in Part II later), which is highly time-consuming for the whole image. Therefore, this architecture reduce the computation time since it requires only instance-level disparity instead of whole image wide. However, this architecture depends on the 2D detection result. If the 2D detector fails (missing or finding something wrong), the final result will also fail as well.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.5\textwidth]{intro3.png}
+    \caption{Instance-level based detection}
+    \label{intro3}
+\end{figure}
+\part{Stereo Based Distance Detection}
+\section{Requirements}
+The task from Lindo is slightly different from 3d object detection. Lindo only wants the distance between observer and the interesting object, but not their pose and orientation. This means that I don’t need to regress yaw angle using network. One specific requirement of this algorithm is that the voxels should come from a neural network, because the customer wants more tolerance on camera calibration and larger baseline. Therefore, our work will base on two constraints: neural network generated voxels and 3d detection results without orientation.
+\section{Pseudo LiDAR Based Model}
+\subsection{Model Architecture}
+Our original model structure is similar to pseudo LiDAR detection algorithm. Generally speaking, in the process, RAFT will be used to generate a disparity map. After that, the disparity map will be converted into depth map and then into voxels. PointNet will be applied to predict labels and pose based on the voxels.
+
+Concretely, RAFT will take two input images (left and right) and output the disparity map based on the left image. It is trained on left-right forward flows, so it can only predict left-right forward disparity.
+
+After we obtain the disparity map of left image, we can use the instinct matrix of left camera to convert the disparity map to a depth map and finally convert it into voxels in 3-dimension. Since we don't have any sensors other than the two cameras, we only need to use the instinct matrix, and the outputted depth map and voxels will be in camera coordinate system. To convert the disparity map to depth map, the equation we should use is:$$depth=\frac{focal\_length\times baseline}{|disparity+(c_{x1}-c_{x0})|}$$where $c_{x0}$ and $c_{x1}$ are the x-coordinate of principle points of left and right cameras. And since we are using CARLA simulator, the difference of the principle points in two cameras is zero. So the final equation we use is:$$depth=\frac{focal\_length\times baseline}{|disparity|}$$but please notice that it doesn't mean the principle point is at $(0,0)$. The coordinate of principle point will be used in the next step.
+
+Once we obtain the depth map, for any point (pixel) of the left image, we can find its depth in the depth map and then convert it into 3-dimension, which is the (x,y,z) coordinate of that point in the real world. By applying such a conversion to every pixel in the left image, we can obtain the voxels. The equation of the conversion from depth map into 3-dimension coordinate system is:$$x_{3D}=\frac{depth[x_{image}][y_{image}]\cdot(x_{image}-c_{x0})}{focal\_length}$$
+$$y_{3D}=\frac{depth[x_{image}][y_{image}]\cdot(y_{image}-c_{y0})}{focal\_length}$$
+$$z_{3D}=depth[x_{image}][y_{image}$$
+where $(c_{x0},c_{y_0})$ is the image coordinate of the principle point of the left camera.
+
+Now we have obtained voxels, which is similar to cloud points obtained from LiDAR. Then our plan is to use PointNet as a 3D detector to predict bouding boxes and labels. The whole architecture is described in fig.~\ref{model1}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{part1/intro/model1.png}
+    \caption{RAFT+POINTNET}
+    \label{model1}
+\end{figure}
+\subsection{Experiment Result}
+We perform the experiment on images produced from CARLA simulator. But we abandon this architecture after we have generated the voxels. To explain the reason, I will use two images (left and right) with a size of (481,707) in this section as an example. I choose this size because this is the same parameter of images on which the RAFT algorithm is trained. The images are shown in fig.~\ref{raft_img}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/raft_img.png}
+    \caption{CARLA images for RAFT}
+    \label{raft_img}
+\end{figure}
+Here we use a pre-trained RAFT model (trained on middlebury dataset) provided by the author. RAFT will predict the disparity map of the left image. Then we convert it into the depth map. They are presented as two grayscale. The result is shown in fig.~\ref{raft_disp}. The lighter area means larger value in the grayscale.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/raft_disp.png}
+    \caption{RAFT disparity map and depth map}
+    \label{raft_disp}
+\end{figure}
+Fig.~\ref{raft_depth_gt} shows the comparison between our predicted depth map and the ground truth depth map from CARLA. Although our depth map are precise in the major objects (vehicles), it looks pretty bad in small or thin objects (trees and billboards). And RAFT also mix the trunks of faraway trees with the background house, which means that RAFT performs poorly in predicting faraway objects.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/raft_vs_gt.png}
+    \caption{Comparison of RAFT depth map and CARLA ground truth}
+    \label{raft_depth_gt}
+\end{figure}
+Then we generate the difference map between ground truth and our depth map by $difference = |gt-depth|$. The result fig.~\ref{raft_gt-pred} shows that the errors mainly come from the background houses and sky, while the major objects (vehicles) remain accurate. So we think that such errors are tolerable, since we are only interesting in the major objects.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{part1/exp/raft_gt-pred.png}
+    \caption{Difference map between RAFT depth and CARLA ground truth}
+    \label{raft_gt-pred}
+\end{figure}
+Now that we have the depth map, we convert it to voxels. Fig.~\ref{raft_voxel} shows the visualization of our voxels. In this picture, you can see many wind-like points (we call they "flying points" in following sections). After we zoomed in the voxels, we find that most flying points are in boundaries.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{part1/exp/raft_voxel.png}
+    \caption{RAFT Voxel}
+    \label{raft_voxel}
+\end{figure}
+To find out how severe the flying point problem is, we plot the relationship between ground truth and our depth map. Theoretically, we want the ground truth and our predicted depth to be equal (at least linear so that we can find a projection function from depth map to ground truth). The result is shown in fig.~\ref{raft_hist}. You can see that due to flying points, some predictions are larger than the ground truth. The relationship between prediction depth map and ground truth is not equal and even not linear. It is hard (and maybe impossible) to capture a projection function between these two maps.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{part1/exp/raft_hist.png}
+    \caption{RAFT depth vs. ground truth}
+    \label{raft_hist}
+\end{figure}
+Generally speaking, the experiment result is not satisfying. The quality of voxels produced by RAFT is not good enough. Part of the possible reason is that I don’t fine-tune the model on CARLA dataset. I just use a pre-trained model which is trained on Middleburry dataset. But except for that, the flying points is a big problem. Flying points affect the object boundaries, making it extremely hard to predict the bounding box (size) of the object. And due to the poor quality of the voxels, we think that PointNet won't perform well, so we need to improve our model.
+\section{Flying Points Problem}
+\subsection{Problem Statement}
+Flying points describe a trail of points from the object to the background (shown in fig.~\ref{flyingpoints}). Concretely, in 3-dimension, if two groups of points are far away from each other in z-axis (depth) but closed in xy-plane, the edge points will tend to connect each group, which results in a wind-like noise. This problem often happens in object boundary, making it hard for bounding box detection.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{part1/intro/flyingpoints.png}
+    \caption{Top view of flyign points problem}
+    \label{flyingpoints}
+\end{figure}
+\subsection{Problem Analysis}
+This is because of the way how they train the model. In training, if you use sampling, then the boundary will be sampled to an average position. The end point loss function also contributes to it. And since flying points happens in boundary, the main part of the depth prediction is correct. So in benchmark it will perform well. But in application it will cause a lot of troubles. So I decided to filter out noises based on their gradient difference in depth map. And it works well, as you can see in right picture. But in crowded scenario, flying points problem is still severe.
+Actually, this also happens in other kind of algorithms, like 3D re-construction algorithm, for example NERF. 
+\subsection{Possible Solution}
+Generally, there are three methods to filter out or prevent flying points. Forward-backward consistency checking and gradient based filtering can be used to filter out flying points after they are generated, while the network might be trained not to produce flying points if you improve the training process.
+\subsubsection{Forward-Backward Consistency Checking}
+Forward-backward consistency checking is proposed in optical flow prediction. When we predict the disparity map based on the left image, we are actually predict the displacement of pixels from left image to right image. In this case, we define the disparity map as "left-flow". We define the "right-flow" in a similar manner. Then, forward-backward consistency checking will compare the difference of left-flow and right-flow. If the difference is too large, then the point is considered unreliable.
+
+The algorithm is shown in fig.~\ref{forward_backward}. Assume that the left-flow is $v_b$ and right-flow is $v_f$, then for every pixel in left image $x_t$ and its correspondence in right image $x_{t+1}$,  we should have:$$x_{t+1}=x_t+v_b(x_t)$$ and $$x_t=v_f(x_{t+1})+x_{t+1}$$
+
+If we subscribe the first equation into another, we should get:$$x_t=v_f(x_t+v_b(x_t))+x_t+v_b(x_t)$$if we move the left hand side to the right side, we will get:$$v_f(x_t+v_b(x_t))+v_b(x_t)=0$$adding some tolerance, finally we should have:
+$$|v_f(x_t+v_b(x_t))+v_b(x_t)|<threshold$$So, if this inequality doesn't hold, it indicates that the left-flow and right-flow is not consistent, in which case the prediction mechanism might not be reliable.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/intro/forward_backward.png}
+    \caption{Forward-Backward consistency checking}
+    \label{forward_backward}
+\end{figure}
+In our application, assume that we get two disparity maps based on both left image and right image. Now, for one pixel $x_{left}$ in left image, we find its correspondence in right image according to the left disparity map, as $x_{right}=x_{left}+disp_{left}$. With this correspondence in right image, we go back to left image according to right disparity: $x_{left}'=x_{right}+disp_{right}$. Then, theoretically speaking there should be only little difference between $x_{left}$ and $x_{left}'$. If the difference is too large, we can consider this pixel as unreliable and hence filter it out.
+
+As I mentioned before, RAFT is trained to predict left-flow (which is always positive). Therefore, it can not be used to predict right-flow directly. The author suggests that we should train the network again in order to predict right-flow, if we want to use consistency checking. But I think that if we flip the images, and switch the inputs (use the flipped right image as left input), the prediction is still left-flow. All we need to do is just flip the disparity map again and inverse it. However, in my experiment, such a method doesn't work well. So I give up this approach.
+\subsubsection{Gradient Based Filtering}
+This is a simple but useful method I use. Since flying points is caused by the smoothing between object boundaries, a simple way is to find all points which belong to object boundaries and filter all of them out. In this case, the flying points will be filtered out, while the majority of objects remains.
+
+To achieve this, we only need to find where there is a large gradient in the depth map. A large gradient means that two adjacent points have a large depth difference, which means that they are belong to two different objects. In this case, they are the object boundaries which could be filtered out.
+
+In my work, I set the threshold for gradient filtering as 0.5. The result is shown in fig.~\ref{gradient}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/raft_gradient.png}
+    \caption{Depth map after filtering}
+    \label{gradient}
+\end{figure}
+You can see that the object boundaries are dark, which means they are filtered out.
+\subsubsection{Improvement in Training Process}
+Another approach is to improve the training process. Since the linear interpolate causes this problem, it might work if we change the linear interpolate method to something like nearest neighbour interpolate. However, the author suggests that all models trained with end point error loss will also tend to smooth object boundary. So only changing the interpolate method might not solve this problem. You might need to change the loss function as well
+\section{Crestereo vs. RAFT-Stereo}
+\subsection{RAFT-Stereo\cite{raft-stereo}}
+RAFT-Stereo is an algorithm improved from RAFT\cite{raft}. RAFT is an algorithm which predicts optical flow between two time-adjacent images, while RAFT-Stereo predicts the disparity between left and right images. Actually, disparity can be considered as an optical flow without y-displacement. RAFT-Stereo (I will call it "RAFT" in the following contents and not mention the origin RAFT algorithm anymore) is composed of three main components: feature extractor, correlation pyramid and GRU-based update operator. The basic architecture is shown in fig.~\ref{raft}.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/intro/raft.png}
+    \caption{RAFT-Stereo model architecture}
+    \label{raft}
+\end{figure}
+\textbf{Feature extractor} of RAFT contains two encoders: feature encoder and context encoder. The feature encoder contains 6 residual blocks with different resolution. In this case the output map will have different resolution in different layers. The context encoder is identical to feature encoder, but it only applies to left image.
+
+\textbf{Correlation volume} is formed by taking dot product between all pairs of feature vectors. After producing first correlation volume, 4 correlation volumes (4-layer pyramid) will be produced by pooling at {1,2,4,8} kernel size at last two dimensions. There is no y-displacement, so the products alone H is not necessary. Therefore, the correlation volume will omit this layer and became W*H*H/$2^k$ Then, given a current optical flow estimation, a look-up operator will be applied. This look-up operator will search these 4 layers and then gives a new feature map by concatenating them. This feature map is called correlation feature.
+
+\textbf{Multi-level update operator} contains multi-resolution update operator to operate on feature maps at 1/8, 1/16, 1/32 resolutions simultaneously. The output of each GRUs are used as hidden layer of other GRU by using upsampling or downsampling. Lookup operator only occurs at 1/8 solutions.
+
+The code of RAFT-Stereo is available at \url{https://github.com/princeton-vl/RAFT-Stereo}
+
+\subsection{CREStereo\cite{crestereo}}
+CREStereo also aims at predicting disparity between left and right images. This algorithm is adapted from RAFT. The architecture is shown in fig.~\ref{crestereo}. In one sentence, CREStereo will compute feature pyramid (feature maps with different resolution) and then put them into Recurrent Update Module (RUM), which includes Adaptive Group Correlation Layer (AGCL). The feature map with resolution of 1/16 will be applied with an attention module.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/intro/crestereo.png}
+    \caption{CREStereo model architecture}
+    \label{crestereo}
+\end{figure}
+
+\textbf{AGCL} reduces the matching ambiguity of stereo matching and only compute local correlation. It is composed of four components: local feature attention, 2D-1D alternate local search, deformable search window and group-wise correlation.
+
+\textbf{Local Feature Attention} helps to avoid computing global correlation for every pair of pixels. The authors only matches points in a local window to avoid large memory consumption and computation cost. This attention with positional encoding is added before computing correlation. If you want to know more about attention module, please refer to LoFTR\cite{loftr} and ViT\cite{vit}.
+
+In RAFT, a cost volume with size of $H\times W\times W$ is computed. In this algorithm, \textbf{2D-1D Alternate Local Search} helps to compute correlation in a local search window which outputs a volume with size of $H\times W\times D$, where $D$ is the number of correlation pairs much smaller than $W$. 
+
+\textbf{Group-wise correlation} split the image into $n$ groups. Then, their local correlation will be computed individually and finally concatenated to get a final result.
+
+The code of CREStereo is available at \url{https://github.com/megvii-research/CREStereo}
+\subsection{Experiment}
+In this section, we will do a similar experiment on CREStereo, and compare the output between CREStereo and RAFT.
+
+To fit the best camera parameters for CREStereo, we generate a new image with a size of (1280,720). The image is in fig.~\ref{cres_img}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/cres_img.png}
+    \caption{CREStereo CARLA image}
+    \label{cres_img}
+\end{figure}
+Then, we compute the disparity map and depth map in the same manner to RAFT. We also compute the prediction vs. ground truth plot.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{part1/exp/cres_disp.png}
+    \caption{CREStereo disparity map}
+    \label{cres_disp}
+\end{figure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{part1/exp/cres_dep.png}
+    \caption{CREStereo depth map}
+    \label{cres_dep}
+\end{figure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{part1/exp/cres_gt.png}
+    \caption{CREStereo depth vs. ground truth}
+    \label{cres_gt}
+\end{figure}
+The depth vs. gt plot shows that CREStereo is much more accurate than RAFT. In fact, the RMSE of RAFT is about 24 meters, while it is only 7 meters for CREStereo (only consider depth within 200 meters)
+
+To see how much better CREStereo performs than RAFT, we also compute their depth map on the same image (the images used in RAFT). The result is shown in fig.~\ref{vs}. You can see that for trees billboards and some other thin objects, CREStereo has a much clear shape and doesn't lose too much information.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{part1/exp/depth_raftvscres.png}
+    \caption{CREStereo depth vs. RAFT depth}
+    \label{vs}
+\end{figure}
+Finally, we compute the voxels of CREStereo. Here, I apply the gradient based filter here to see its effect. You can see that most flying points are filtered, but in crowded scenes many flying points still remain.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{part1/exp/cres_voxel.png}
+    \caption{CREStereo voxel}
+    \label{cres_vox}
+\end{figure}
+\section{YOLO Based Model}
+\subsection{Model Architecture}
+Due to the poor quality of voxels, we decided not to use 3D object detection algorithm. Since we only need labels and distance but not orientations, we can obtain the result if we can identify which part of voxels belong to the interesting object. Therefore, besides of using CREStereo to get voxels, we use yolo to predict 2d bounding box and label, and then extract voxels which corresponds to the pixels in the bounding box. Since 2d bounding box will contain some background, we need to filter them out. Here I use DBSCAN as a clustering algorithm and obtain a relatively good performance.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{part1/intro/model2.png}
+    \caption{CRESTEREO+YOLO+DBSCAN}
+    \label{model2}
+\end{figure}
+In the application of DBSCAN, we believe that since the bounding box should contain the whole object with a little background. the majority of voxels should be the object. So, after clustering, we will count the number of points in each category and take the category with the largest amoun of points as our target vehicle (or pedestrian).
+\subsection{DBSCAN vs. Sigma-Rejection}
+\subsubsection{DBSCAN}
+It is a density-based clustering non-parametric algorithm: given a set of points in some space, it groups together points that are closely packed together (points with many nearby neighbors), marking as outliers points that lie alone in low-density regions (whose nearest neighbors are too far away). DBSCAN is one of the most common clustering algorithms and also most cited in scientific literature.
+
+DBSCAN requires two parameters: ε (eps) and the minimum number of points required to form a dense region (minPts). It starts with an arbitrary starting point that has not been visited. This point's ε-neighborhood is retrieved, and if it contains sufficiently many points, a cluster is started. Otherwise, the point is labeled as noise. Note that this point might later be found in a sufficiently sized ε-environment of a different point and hence be made part of a cluster.
+
+If a point is found to be a dense part of a cluster, its ε-neighborhood is also part of that cluster. Hence, all points that are found within the ε-neighborhood are added, as is their own ε-neighborhood when they are also dense. This process continues until the density-connected cluster is completely found. Then, a new unvisited point is retrieved and processed, leading to the discovery of a further cluster or noise.
+
+DBSCAN can be used with any distance function(as well as similarity functions or other predicates). The distance function (dist) can therefore be seen as an additional parameter.
+
+In fig.~\ref{dbscan}, minPts = 4. Point A and the other red points are core points, because the area surrounding these points in an ε radius contain at least 4 points (including the point itself). Because they are all reachable from one another, they form a single cluster. Points B and C are not core points, but are reachable from A (via other core points) and thus belong to the cluster as well. Point N is a noise point that is neither a core point nor directly-reachable.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.4\textwidth]{part1/intro/dbscan.png}
+    \caption{DBSCAN diagram}
+    \label{dbscan}
+\end{figure}
+\subsubsection{Sigma-Rejection}
+Sigma-rejection is purely based on statistics. Generally, it will 
+
+Here is what the sigma-reject algorithm does:
+\begin{enumerate}
+    \item From the set of corresponding pixel values from each source image, compute the mean (average) and standard deviation of these values.
+    \item Compute a new mean, omitting pixels from the above set that fall further away than threshold standard deviations from the mean. Use this new mean as the output value for this pixel location.
+    \item Repeat steps 1-2 for every pixel in the final image.
+\end{enumerate}
+
+But Sigma rejection has some weaknesses. Rejection sampling can lead to a lot of unwanted samples being taken if the function being sampled is highly concentrated in a certain region, for example a function that has a spike at some location. For many distributions, this problem can be solved using an adaptive extension (WIKI). I will show this weakness in our comparison later.
+
+\subsubsection{Comparison}
+In this section, I will show some results which tells we can't use sigma rejection here. I will focus on the failures of sigma rejection. As for the results of DBSCAN, I will leave them on the experiment section, since they are our final results.
+
+In sigma rejection, it will repeatedly filter out points with depth > mean + std, until the std is stable. In most cases, it will ensure that those faraway flying points and noise are filtered out. However, if most of extracted voxels belong to the interesting object, then sigma-rejection will filter out some key points which belong to the object. You can see an example in fig.~\ref{sigma_hist}. All points in this histogram belongs to the same object, therefore all of them should be kept. DBSCAN will keep them all, while sigma rejection will filter out all points with depth larger than std+mean.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/sigma_hist.png}
+    \caption{Sigma rejection over-filtering}
+    \label{sigma_hist}
+\end{figure}
+
+Also, sigma-rejection is totally depend on the statistic results of depth, so when some noise have the same depth, but different x or y coordinate, it will keep these points. In fig.~\ref{sigma_bbx}, for the bounding box of the car, sigma rejection also includes the left part (which is an obstacle). This is because that this obstacle has the same depth but different x-axis coordinate. They belong to different objects in shape, but they are the same in depth. In this case, sigma rejection also fails.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/sigma_bbx.png}
+    \caption{Sigma rejection bounding box}
+    \label{sigma_bbx}
+\end{figure}
+\subsection{Experiment Result}
+In this section, I will show some experiment results of this model. I won't put too much analysis here, since there is nothing more to discuss.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/9.png}
+    \caption{Frame 9}
+    \label{f9}
+\end{figure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/13.png}
+    \caption{Frame 13}
+    \label{f13}
+\end{figure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/16.png}
+    \caption{Frame 16}
+    \label{f16}
+\end{figure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part1/exp/19.png}
+    \caption{Frame 19}
+    \label{f19}
+\end{figure}
+\section{Conclusion and Discussion}
+For CREStereo and RAFT, I think CREStereo is much accurate. However, CREStereo also produce more flying points than RAFT. Personally, I really wonder how these two algorithms will perform after training on CARLA dataset. But in computation speed, both of these two algorithms are slow. In my computer (NVIDIA Quador P1000), it will take more than 30 seconds to complete one inference. For GPU memory, CREStereo will take up 3GB of memory in inference, while RAFT will need more than that.
+
+For our model, I think it satisfies our requirements. But as a "2D detection based" algorithm, I also encounter the "detection failure" problem. As shown in fig.~\ref{yolo_fail}, the 2D detector Yolo fails. It recognize a car where there is nothing at all. Then, it directly lead to the failure of our algorithm.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{part1/exp/yolo_fail.png}
+    \caption{Frame 19}
+    \label{yolo_fail}
+\end{figure}
+In addition, I believe that our model will perform badly on crowded scenes. There are two reasons for that: (1) the quality of voxels in crowded scenes are much pool. (2) In crowded situation, the vehicles behind are blocked by the first one. In this case, if we want to detect the behind cars, it is possible that the majority of voxels doesn't belong to the interesting car but the first one car. Then the whole algorithm will also fail.
+\part{Stereo based 3D Object Detection}
+\section{Requirement}
+Except for distance and label, we now want to predict the pose (orientation) of the interesting object. Orientation prediction is always the most difficult part in 3D object detection, and we think that it is impossible to predict orientation using classic machine learning algorithms. So we are looking into Stereo based 3D object detection algorithms. 
+
+In this part, I will analyze several brand new Stereo based 3D object detection algorithms. I will describe their architecture, benchmark performance and their training requirements (setup). After that, I will compare two of these algorithms using some examples.
+\section{Literature Review}
+LiDAR is expensive to deploy or maintain in practical use, and has limited sensing range in some cases, which makes the vision-based 3D detection methods draw more attention recently. Compared to LiDAR-based methods, the key information about depth is not manifest in the given 2D images. This problem is especially prominent for monocular cases. However, stereo cameras can be used to estimate the depth information, which ease this problem in some degrees. So, the motivation of Stereo based 3D object detection is to use two cheap cameras to replace the expensive multi-rays LiDAR and obtain depth information.
+
+A very basic terminology in Stereo detection is \textbf{cost volume}. This is used in almost every algorithms in this field. In one word, cost volume is the 4D disparity matrix in stereo matching. It can be simply considered as a 4D tensor used to measure the similarity of left and right images in stereo matching. When constructing cost volume, the input is feature maps of both left and right images (dimension $B\times C\times H\times W$, where B is the batch size, C is the channel, H and W are the size of the image). The output is the cost volume (dimension $B\times C\times D \times H\times W$, where D is defined as the maximum disparity). There are three kinds of calculating methods for cost volume: difference, concat, correlation.
+\begin{description}
+    \item [Difference defined cost volume] In computation, this algorithm will iterate over the $D$ (maximum disparity) dimension. the cost volume here can be considered as the similarity between left and right cameras in disparity $i$, as $disp_i(x,y)=left(x,y)-right(x+i,y)$.
+    \item [Concat defined cost volume] The difference between concat defined cost volume and difference defined cost volume is that it doesn't do the subtraction. Instead, it will concate each feature map and output $B\times 2C \times D \times H \times W$
+    \item [Correlation defined cost volume] Instead of subtraction, it will calculate the correlation between left and right images.
+\end{description}
+
+In the beginning of this report, I have already mentioned three kinds of commonly used model in Stereo based 3D object detection field. So in this part, I will briefly introduce some papers which correspond to those three models.
+
+
+\section{SIDE\cite{DBLP:journals/corr/abs-2108-09663}}
+The basic architecture is shown in fig.~\ref{side}. This algorithm belongs to the third kind of model, so it proceeds in three steps: 2D detection on both left and right images; depth estimation on 2D detection results; post processing to obtain final 3D object detection results. 
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/intro/side.png}
+    \caption{SIDE}
+    \label{side}
+\end{figure}
+
+\textbf{In the first step}, the main function is to output 2D detection results on both left and right images. This is actually a 2D object detection problem. Therefore, the author refers to the methods proposed by CenterNet\cite{centernet}. They use the heatmap of object's center to represent each object. The heat map is generated through the backbone and other branches are linked according to the position of each object in the heatmap. 
+
+For following 3D detection task, the author makes some modification to the model architecture.
+\begin{itemize}
+    \item Except for basic 2D bounding box from heatmap, the author also introduces two other branches, whose predictions are orientation and dimension.
+    \item In order to alleviate the imbalance problem of positive and negative training samples, the author uses focal loss to train the neural network.
+    \item Since the detection is based on stereo camera image, the object's position could be corrected in stereo images to ensure the vertical position of the same object in the same. Concretely, for two bounding boxes of the same object, y1 and y2 are the same. So the author only predicts a shared y when predicting the position.
+\end{itemize}
+
+\textbf{The second step} is about instance level depth estimation. The main function of this step is to use the 2D detection result of each object to output the depth estimation of each object center. Notice that here only the depth of the object center is estimated. There are two advantages of such an design:
+\begin{itemize}
+    \item Since only the depth of the object center is estimated, it doesn't need the depth map in training process. Only the annotated object depth information in the 3D ground truth is required for supervision.
+    \item The cost volume is less complex, since the interesting area is very small. In this case, the inference speed will be improved.
+\end{itemize}
+The author also wants to fully utilize the whole information space of the cost volume. Therefore, an attention module is added (Structure-aware Attention Mechanism) to convert 3D feature space to the bird's-eye-view to reduce the interference of unstructured spatial noise.
+
+\textbf{In the last step}, since the dimension and orientation are obtained in step1 and location is obtained in step2, only some simple post processing is needed to get the final 3D object detection results.
+
+In benchmark, this algorithm achieves a SOTA accuracy. Meanwhile, it has a great advantage in inference speed. The result is shown in fig.~\ref{side_benchmark}.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=1\textwidth]{part2/intro/side_benchmark.jpg}
+    \caption{SIDE kitti validation set result}
+    \label{side_benchmark}
+\end{figure}
+\textbf{Training requirement}:
+\begin{itemize}
+    \item stereo images
+    \item 2D detection results, 3D labels, including location, dimension and orientation (kitti labels)
+    \item calibration files
+\end{itemize}
+The code is available at \url{https://github.com/linmo2333/SIDE}
+\section{DSGN++\cite{dsgn}}
+This model is improved from DSGN\cite{dsgn_o} network. Their DSGN++ model increases the capacity of stereo modeling in three aspects:
+\begin{enumerate}
+    \item introduce a generic operator for allowing denser connections between 2D and stereo volumes
+    \item introduce a new volume structure for aggregating more view-specific features
+    \item introduce a multi-modal data augmentation strategy for increasing the positive ratios (for training)
+\end{enumerate}
+The architecture of this model is shown in fig.~\ref{dsgn}. There are three major components of this network: 2D image extraction network, volume construction with Depth-wise Plane Sweeping and Dual-view flow integration followed by 3D CNN. Other 4 parts are normal detector or extractor from DSGN, which won't be introduced in details.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/intro/DSGN2.jpg}
+    \caption{DSGN++}
+    \label{dsgn}
+\end{figure}
+The \textbf{feature extractor} in this model is the same as DSGN. In DSGN, the author refers to PSMNet\cite{plumenet} to use a Siamese network which contains two identical shared-weights network to extract feature maps from both left and right images. To extract higher dimension features, the author increases the number of higher dimension CNN operator. For example, the number of conv\_2 to conv\_5 in PSMNet is {3,16,3,3} and in DSGN the number is {3,6,12,4}.
+
+\textbf{Depth-wise Plane Sweeping}(D-PS) contributes to constructing a more dense feature volume. Instead of compressing 2D channels to a small number, the author preserves the number of channels at a relatively large number and slice the feature via a sliding window along the channel axis. The shift on the channel axis depends on pixel disparity. The author also applise Cyclic Slicing to make sure the local feature similarity for adjacent objects. The simple example of this step is shown in fig.~\ref{dsgn2sweep}. The cyclic slicing move in the depth axis and slices in the channel axis to construct a final depth-wise volume, which is more dense than previous feature volumes.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/intro/dsgn2sweep.png}
+    \caption{Depth-wise plane sweeping}
+    \label{dsgn2sweep}
+\end{figure}
+
+\textbf{Dual-view Stereo Volume}(DSV) helps to build a effective 3D Representation. The author designs this module so that the volume could have both front-view representation and top-view representation(depth signals) in consider. After D-PSV and D-3DGV, the author aggregates both information flows. This allows the voxel to aggregate differently spaced 3D structure information and further expand the 2D-to-3D information flow. To perceive accurate front-surface depths, the depth head on stereo volume in 3D space (DSV) is first transformed to the frustum space followed by front-view depth supervision. Meanwhile, 3D bounding boxes supervision also acts on the same feature volume.
+
+After the DSV, a 3D CNN Hourglass model is applied to the stereo volume to produce a feature map. After that, it can be used to generate BEV and depth map, and finally a BEV detector is used to generate final results.
+
+Fig.~\ref{dsgnbench} shows the benchmark on kitti dataset. We can see that DSGN++ has about 2\% of improvements in car 3D detection task.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/intro/dsgn_bench.png}
+    \caption{DSGN++ kitti benchmark}
+    \label{dsgnbench}
+\end{figure}
+\textbf{Training requirement}
+\begin{itemize}
+    \item kitti labels
+    \item velodyne
+    \item stereo images
+    \item road plane (optional)
+\end{itemize}
+The code is available at \url{https://github.com/chenyilun95/DSGN2}
+\section{YOLO Stereo3D\cite{yolo3d}}
+YOLO Stereo3D belongs to the second kind of model. The network inference structure is shown in fig.~\ref{yolo3d}. It contains two major parts: shared backbone feature extractor and multi-scale fusion. 
+
+The shared backbone will extract feature maps with different scales from input images. Then it will be used to generate correlation matrix. This step is very similar to RAFT. The output is multi-scale correlation (which is one kind of cost volume, as I mentioned before). 
+
+Then the multi-scale fusion structure will handle the feature maps differently according to their scales. For downsampling level of $\frac{1}{4}$ and $\frac{1}{8}$, the author constructs a light-weight cost volume of a max-disparity of 96 and 192. Then they are fed into networks and concatenated with features at a smaller scale. At downsampling level of $\frac{1}{16}$, the number of channels will be firstly downsampled by a $1\times 1$ convolution. The author explains his idea as:" Higher resolution features are usually local features with higher frequency portions, and lower resolution features contain semantic information at a large scale."
+
+After the multi-scale fusion, a MLP will be added to predict disparity. And the output will also be combined with the original feature map to predict 3D bounding box. Notice that the final result (3D bounding box) doesn't really rely on the disparity map. The goal of MLP here is to introduce the disparity loss to supervise the multi-scale fusion layers. The author states that this model can be trained without disparity supervision. However, it will perform much better is disparity is added into ground truth.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{part2/intro/yolo3d.png}
+    \caption{YOLO Stereo3D}
+    \label{yolo3d}
+\end{figure}
+Fig.~\ref{yolo3d_benchmark} shows the benchmark result on kitti 3D object detection dataset. The author also mentioned that their training speed can achieve 10 fps on 1080Ti hardware.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{part2/intro/yolo3d_benchmark.png}
+    \caption{YOLO Stereo3D kitti benchmark result}
+    \label{yolo3d_benchmark}
+\end{figure}
+\textbf{Training requirement}
+\begin{itemize}
+    \item stereo images
+    \item 3D labels, including location, dimension and orientation (kitti labels)
+    \item disparity map (optional)
+\end{itemize}
+
+The code is available at \url{ https://github.com/Owen-Liuyuxuan/visualDet3D/blob/master/docs/stereo3d.md}
+\section{Disp-RCNN\cite{disp_rcnn}}
+Disp-RCNN belongs to the third kind of model. The motivation is that the author thinks since the disparity estimation process operates on the full image, it will fail to produce accurate disparities on low textured or non-Lamberterian surfaces like vehicle surfaces. 
+
+The whole network is composed of three components: Stereo Mask R-CNN, iDispNet and 3D detector. In another word, it is a three-stage network.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/intro/disp_rcnn.png}
+    \caption{Disp RCNN}
+    \label{disp_rcnn}
+\end{figure}
+\textbf{Stereo Mask R-CNN} is made of two steps. The first step is feature extractor from Stereo R-CNN. The candidate bounding boxes in left and right images come from the same group of anchor. This will guarantee the correct links of RoIs on left and right images. Then, the RoIAlign from Mask R-CNN will extract features from feature map. And two heads will predict 2D detection results and masks.
+
+\textbf{iDispNet: Instance Disparity Estimation Network} responds for recovering 3D data for detection. iDispNet only takes RoI images as input, and capture the special class of shape to generate more precise disparity estimation.
+
+Concretely, for a pixel $p$ in the left image, we define its disparity as:
+$$D_f(p)=u_p^l-u_p^r$$
+where $u_p^l$ and $u_p^r$ represents the x-axis coordinate of pixel $p$ in both left and right images. In Stereo Mask R-CNN we have already obtained 2D bounding box (ROIs). As I mentioned before, these two ROIs have the same height, y-axis location and size. Now, the disparity changes to:
+$$D_i(p)=D_f(p)-(b^l-b^r)$$
+where $b^l$ and $b^r$ represents the $x_{min}$ of both left and right bounding box. The goal of this network is to predict such a $D_i(p)$. After getting this $D_i(p)$, it can be converted into 3D space, using the equation:
+$$X = \frac{(u_p-c_u)}{f_u}Z$$$$Y = \frac{(v_p-c_v)}{f_v}Z$$$$Z=\frac{Bf_u}{D_i(p)+b^l-b^r}$$
+where $B$ is baseline, $(c_u,c_v)$ is principle point and $f_u$, $f_v$ are focal length.
+
+In training, this algorithm requires disparity ground truth, but most 3D object detection dataset don't provide these labels. Therefore, the author provides a method for \textbf{Pseudo Ground-truth Generation}. This generation process is achieved by a class-specific shape prior model from which the object shape can be constructed and subsequently rendered to the image plane to obtain dense disparity ground-truth.
+
+The benchmark result is shown in fig.~\ref{disp_bench}. It has a about 10\% of improvements compared to other SOTA algorithms.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{part2/intro/disp_benchmark.jpg}
+    \caption{Disp RCNN benchmark on kitti dataset}
+    \label{disp_bench}
+\end{figure}
+\textbf{Training requirement}
+\begin{itemize}
+    \item stereo images
+    \item kitti labels
+    \item you need to download additional labels (right image 2D labels and the disparity ground truth). The author provides them in README. Please download them as well
+    \item one model can only predict one class
+\end{itemize}
+The code is available at \url{https://github.com/zju3dv/disprcnn}
+\section{Experiment Result}
+In this section, we run both YOLO Stereo3D and Disp-RCNN on some validation samples and compare their detection results.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/exp/ex1.png}
+    \caption{Sample 312}
+    \label{ex1}
+\end{figure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/exp/ex2.png}
+    \caption{Sample 677}
+    \label{ex2}
+\end{figure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/exp/ex3.png}
+    \caption{Sample 981}
+    \label{ex3}
+\end{figure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{part2/exp/ex4.png}
+    \caption{Sample 1416}
+    \label{ex4}
+\end{figure}
+Experiment shows that both algorithm will have some detection failures on both occlusion and faraway situation. Theoretically, failure of Disp-RCNN is due to the 2D detection results. For YOLO Stereo3D, it might comes from the multi-class, which average the ability in detecting a specific class.
+\section{Discussion}
+In experiment, the Disp-RCNN performs better in bounding box detection. However, Disp-RCNN needs more computation time than YOLO Stereo3D. In our experiment, YOLO Stereo3D takes 1 second to run inference on one image (including start time), while Disp-RCNN needs 3-4 seconds. In addition, YOLO Stereo3D can identify all classes, but Disp-RCNN can only handle one class in one model. This means that in multi-class estimation, Disp-RCNN might require more computation time because you need to run several models to predict all classes.
+
+For all four algorithms, I think Disp-RCNN and SIDE are the same kind of algorithm. They both do a 2D detection first and then calculate local disparity map to do 3D detection. This reduce the computation time for inference. YOLO Stereo3D and DSGN++ are both end to end algorithm. YOLO Stereo3D directly makes prediction from feature volumes. For DSGN++, it converts the images into feature volumes, and use sweeping to make the volumes more dense. After that, it convert the results into BEV vectors to do BEV 3D detection. I think that this is a very good idea to consider the global BEV representation, and perhaps it is why it has the highest score in benchmark.
+\newpage
+\nocite{*}
+%\bibliographystyle{unsrt}
+\bibliographystyle{IEEEtran}
+%\bibliographystyle{unsrt}
+\bibliography{reference}
+\newpage
+\part{Appendix}
+\input{code.tex}
+\end{document}
