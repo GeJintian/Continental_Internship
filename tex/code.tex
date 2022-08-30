@@ -1,28 +1,8 @@
-\footnotesize
+
 \section*{Model Architecture Code}
-\subsection*{README.md}
-\begin{lstlisting}
-#### Install
-To run this file, you should install yolov5 and Crestereo.<br>
-For yolov5, please follow: https://github.com/ultralytics/yolov5 <br>
-For Crestereo, please follow: https://github.com/megvii-research/CREStereo <br>
-Please also install packages: matplotlib, seaborn, sklearn, shutil, open3d, PIL, opencv-python <br>
-Please move sigma_reject.py to the root directory of Crestereo. You will also need to download pre-trained models.<br>
-#### Dataset
-I assume that the dataset will look like: ```.../image/im0/1.png``` (for left img) and ```.../image/im1/1.png``` (for right img). So the program will take ```--input_dir``` (which is ```.../image``` here) and ```--number``` (which is 1 here).<br>
-You will also need to create some empty directories for result saving. It should also under the root directory of Crestereo, as:<br>
-CREStereo-master:.<br>
-└───img<br>
-\\\\\ ├───BEV_sigma_dbscan<br>
-\\\\\ ├───dist_sigma_dbscan<br>
-\\\\\ └───yolo_result<br>
-Notice that I run this program on windows. So I use "\\" to separate directories in the code. If you run it on linux, you may need to change it.<br>
-#### Run inference
-This is an example of running code. You can check the file for details <br>
-```python sigma_reject.py --model_path crestereo_eth3d.mge --input_dir .../image --size 720x1280 --output disparity.png --number 7```
-\end{lstlisting}
-\subsection*{sigma_reject.py}
-\begin{lstlisting}
+
+\subsection*{sigma\_reject.py}
+\begin{minted}[breaklines,fontsize=\footnotesize]{python}
 import os
 import sys
 
@@ -256,7 +236,8 @@ def repeated_sigma(bbx2d, depth_map,use_repeated,use_DBSCAN,save_hist,frame,numb
         sns.histplot(depth_statistic)
         plt.axvline(miu,0,30000)
         plt.axvline(miu+sigma,0,30000)
-        plt.savefig("img\\dist_sigma_dbscan\\"+str(frame)+"_"+str(number)+".png")
+        plt.savefig("img\\dist_sigma_dbscan\\"+str(frame)
+                    +"_"+str(number)+".png")
         plt.cla()
 
     #For Corner. No use anymore
@@ -430,23 +411,35 @@ if __name__=="__main__":
         # You can add more classes here as interesting class ()
         if yolo_result["name"][i] == "car" or yolo_result["name"][i]=="person" or yolo_result["name"][i] == "truck" or yolo_result["name"][i] =="motorcycle":
             is_interest = True
-        bbx2d = [int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i])),int(np.round_(yolo_result["xmax"][i])),int(np.round_(yolo_result["ymax"][i]))]
+        bbx2d = [int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i])),
+                int(np.round_(yolo_result["xmax"][i])),
+                int(np.round_(yolo_result["ymax"][i]))]
         # This line generate the 3D bounding box
         center, zmin, zmin_T,point_set,bev_corner = repeated_sigma(bbx2d,depth_map,False,True,False,args.number,i)
         # The followings are adding texts into yolo detection results. Not important if you only want to see 3D results
-        cv2.putText(img,"AVG: %.2f" % center,(int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i]))+10),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
-        cv2.putText(img,"zmin: %.2f" % zmin,(int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i]))+25),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
-        cv2.putText(img,"true_zmin: %.2f" %zmin_T,(int(np.round_(yolo_result["xmin"][i])),int(np.round_(yolo_result["ymin"][i]))+40),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
+        cv2.putText(img,"AVG: %.2f" % center,(int(np.round_(yolo_result["xmin"][i])),
+                    int(np.round_(yolo_result["ymin"][i]))+10),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
+        cv2.putText(img,"zmin: %.2f" % zmin,(int(np.round_(yolo_result["xmin"][i])),
+                    int(np.round_(yolo_result["ymin"][i]))+25),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
+        cv2.putText(img,"true_zmin: %.2f" %zmin_T,(int(np.round_(yolo_result["xmin"][i])),
+                    int(np.round_(yolo_result["ymin"][i]))+40),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.7,(255, 0, 0),2,cv2.LINE_AA)
         # Add to 3d draw_list
         bbx3d1 = add_bbx(point_set,True)
         draw_list.append(bbx3d1)
         # This is for bev
         if is_interest is True:
             #(depth,x)
-            draw.line((bev_corner[2][1],bev_corner[2][0],bev_corner[3][1],bev_corner[3][0]),fill = 128, width = 3)
-            draw.line((bev_corner[0][1],bev_corner[0][0],bev_corner[1][1],bev_corner[1][0]),fill = 128, width = 3)
-            draw.line((bev_corner[1][1],bev_corner[1][0],bev_corner[3][1],bev_corner[3][0]),fill = 128, width = 3)
-            draw.line((bev_corner[2][1],bev_corner[2][0],bev_corner[0][1],bev_corner[0][0]),fill = 128, width = 3)
+            draw.line((bev_corner[2][1],bev_corner[2][0],bev_corner[3][1],bev_corner[3][0]),
+                        fill = 128, width = 3)
+            draw.line((bev_corner[0][1],bev_corner[0][0],bev_corner[1][1],bev_corner[1][0]),
+                        fill = 128, width = 3)
+            draw.line((bev_corner[1][1],bev_corner[1][0],bev_corner[3][1],bev_corner[3][0]),
+                        fill = 128, width = 3)
+            draw.line((bev_corner[2][1],bev_corner[2][0],bev_corner[0][1],bev_corner[0][0]),
+                        fill = 128, width = 3)
 
     # Saving BEV
     # resolution: 0.1; x: +-16; z: +100
@@ -467,11 +460,11 @@ if __name__=="__main__":
     shutil.move(yolo_img_path,"img\\yolo_result\\"+args.number+".jpg")
     os.rmdir("runs/detect/exp")
 
-\end{lstlisting}
-
+\end{minted}
+\newpage
 \section*{kitti labels visualization}
-\subsection*{bbx_visualize.py}
-\begin{lstlisting}
+\subsection*{bbx\_visualize.py}
+\begin{minted}[breaklines,fontsize=\footnotesize]{python}
 import numpy as np
 import open3d
 import struct
@@ -533,7 +526,8 @@ if __name__=="__main__":
         object_list.append(obj)
         line = f.readline()[:-2]
     #pc_list = voxel_construction(focal,img_height,img_w,file_name+".npy")
-    pc_list = read_kitti_velodyne("..\\kitti_object_detection\\velo\\training\\velodyne\\"+file_name+".bin")
+    pc_list = read_kitti_velodyne("..\\kitti_object_detection\\velo\\training\\velodyne\\"
+                                    +file_name+".bin")
     pcd = open3d.open3d.geometry.PointCloud()
     pcd.points = open3d.open3d.utility.Vector3dVector(pc_list)
     draw_list = [pcd]
@@ -545,9 +539,10 @@ if __name__=="__main__":
     COR = open3d.open3d.geometry.TriangleMesh.create_coordinate_frame(size = 15, origin = [0,0,0])
     draw_list.append(COR)
     open3d.open3d.visualization.draw_geometries(draw_list)
-\end{lstlisting}
+\end{minted}
+\newpage
 \subsection*{bbx.py}
-\begin{lstlisting}
+\begin{minted}[breaklines,fontsize=\footnotesize]{python}
 """ Helper methods for loading and parsing KITTI data.
 Author: Charles R. Qi
 Date: September 2017
@@ -927,12 +922,13 @@ def draw_projected_box3d(image, qs, color=(255,255,255), thickness=2):
        i,j=k,k+4
        cv2.line(image, (qs[i,0],qs[i,1]), (qs[j,0],qs[j,1]), color, thickness, cv2.CV_AA)
     return image
-\end{lstlisting}
+\end{minted}
+\newpage
 \section*{Experiment Code}
 \subsection*{Notice}
 This part of code is not important. They are just test codes used in my experiment. Using the main code above you can repeat my work. I provide these codes just for your reference. These codes are not carefully annotated, and some old experiments (like forward-backward consistency checking) are commented out. You will need to read through those codes if you want to repeat them.
-\subsection*{Crestereo_voxel.py}
-\begin{lstlisting}
+\subsection*{Crestereo\_voxel.py}
+\begin{minted}[breaklines,fontsize=\footnotesize]{python}
 import os
 import math
 import megengine as mge
@@ -1191,9 +1187,10 @@ if __name__ == "__main__":
     open3d.open3d.visualization.draw_geometries([pcd,])
 
 
-\end{lstlisting}
-\subsection*{test_middlebury.ipynb}
-\begin{lstlisting}
+\end{minted}
+\newpage
+\subsection*{test\_middlebury.ipynb}
+\begin{minted}[breaklines,fontsize=\footnotesize]{python}
 from __future__ import print_function, division
 import sys
 sys.path.append('core')
@@ -1338,7 +1335,8 @@ pc_list
 
 from PIL import Image
 import cv2
-gt = cv2.imread("D:\\Weeks\\ai_stereo\\RAFT-Stereo-main\\datasets\\Middlebury\\MiddEval3\\trainingQ\\Carla\\depth004788.png",flags = cv2.IMREAD_COLOR)
+gt = cv2.imread("D:\\Weeks\\ai_stereo\\RAFT-Stereo-main\\datasets
+                \\Middlebury\\MiddEval3\\trainingQ\\Carla\\depth004788.png",flags = cv2.IMREAD_COLOR)
 #gt.show()
 gt = np.array(gt)
 #img = Image.fromarray(gt.astype('uint8'),'L')
@@ -1417,4 +1415,136 @@ import open3d
 pcd = open3d.open3d.geometry.PointCloud()
 pcd.points = open3d.open3d.utility.Vector3dVector(pc_list)
 open3d.open3d.visualization.draw_geometries([pcd])
-\end{lstlisting}
+\end{minted}
+\newpage
+\subsection*{stereo.py}
+\begin{minted}[breaklines,fontsize=\footnotesize]{python}
+import glob
+import os
+import sys
+import queue
+try:
+    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
+        sys.version_info.major,
+        sys.version_info.minor,
+        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
+except IndexError:
+    pass
+
+import carla
+import random
+import time
+import numpy as np
+
+
+def generate_images():
+    # Basic settings
+    actor_list = []
+    client = carla.Client('localhost',2000)
+    client.set_timeout(2.0)
+    world = client.get_world()
+
+    try:
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05
+        world.apply_settings(settings)
+
+        #Create vehicles
+        blueprint_library = world.get_blueprint_library()
+        bp = random.choice(blueprint_library.filter('vehicle'))
+        if bp.has_attribute('color'):
+            color = random.choice(bp.get_attribute('color').recommended_values)
+            bp.set_attribute('color',color)
+        transform = random.choice(world.get_map().get_spawn_points())
+        vehicle = world.spawn_actor(bp, transform)
+        actor_list.append(vehicle)
+        vehicle.set_autopilot(True)
+
+        focal_len = 1000
+        fov = 360*np.arctan(1280/(2*focal_len))/np.pi
+        baseline = 1
+        # For depth camera
+        camera_depth = blueprint_library.find('sensor.camera.depth')
+        camera_depth.set_attribute("image_size_x",str(1280))
+        camera_depth.set_attribute("image_size_y",str(720))
+        camera_depth.set_attribute("fov",str(fov))
+        camera_transform = carla.Transform(carla.Location(x=2,y=-0.5,z=1.4))
+        camera_d = world.spawn_actor(camera_depth, camera_transform, attach_to=vehicle)
+        actor_list.append(camera_d)
+        cc = carla.ColorConverter.LogarithmicDepth
+        depth_queue = queue.Queue()
+        camera_d.listen(depth_queue.put)
+
+
+        # For RGB camera
+        # left camera
+        cam_bp = world.get_blueprint_library().find('sensor.camera.rgb')
+        cam_bp.set_attribute("image_size_x",str(1280))
+        cam_bp.set_attribute("image_size_y",str(720))
+        cam_bp.set_attribute("fov",str(fov))
+        camera_l = world.spawn_actor(cam_bp, camera_transform,attach_to=vehicle)
+        actor_list.append(camera_l)
+        l_queue = queue.Queue()
+        camera_l.listen(l_queue.put)  
+        # right camera
+        camera_r = world.spawn_actor(cam_bp, carla.Transform(carla.Location(x=2,y=0.5,z=1.4)), attach_to=vehicle)
+        actor_list.append(camera_r)
+        r_queue = queue.Queue()
+        camera_r.listen(r_queue.put)
+
+        # print out camera parameters
+        print("image width",cam_bp.get_attribute("image_size_x").as_int())
+        wide = cam_bp.get_attribute("image_size_x").as_int()
+        print("image height",cam_bp.get_attribute("image_size_y").as_int())
+        print("fov",cam_bp.get_attribute("fov").as_float())
+        fov = cam_bp.get_attribute("fov").as_float()
+        print("focal",wide / (2.0 * np.tan(fov * np.pi / 360.0)))
+
+        for _ in range(0, 80):
+            transform.location.x += 3.0
+
+            bp = random.choice(blueprint_library.filter('vehicle'))
+
+            # This time we are using try_spawn_actor. If the spot is already
+            # occupied by another object, the function will return None.
+            npc = world.try_spawn_actor(bp, transform)
+            if npc is not None:
+                actor_list.append(npc)
+                npc.set_autopilot(True)
+                print('created %s' % npc.type_id)
+        for _ in range(20):
+            pedestrian_bp = random.choice(blueprint_library.filter('*walker.pedestrian*'))
+            transform = random.choice(world.get_map().get_spawn_points())
+            npc = world.try_spawn_actor(pedestrian_bp,transform)
+            if npc is not None:
+                actor_list.append(npc)
+                print('people %s' % npc.type_id)
+        time.sleep(1)
+        counting_frame = 1
+        start_frame = 5
+        while True:
+            world.tick()
+            #print(counting_frame)
+            image_d = depth_queue.get()
+            image_l = l_queue.get()
+            image_r = r_queue.get()            
+            if counting_frame % start_frame == 0:#When the car is stable
+                print(counting_frame)
+                image_d.save_to_disk('depth\\'+str(int(counting_frame/start_frame))+'.png')
+                image_l.save_to_disk('im0\\'+str(int(counting_frame/start_frame))+'.png')
+                image_r.save_to_disk('im1\\'+str(int(counting_frame/start_frame))+'.png')
+            # fp = open("stereo_out/%06d.txt"%image_d.frame,'w')    
+            # for i in actor_list:
+            
+            #     fp.write(str(i.bounding_box.get_world_vertices(i.get_transform())))
+            # fp.close()
+            counting_frame = counting_frame + 1
+    finally:
+        camera_d.destroy()
+        camera_l.destroy()
+        camera_r.destroy()
+        client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
+if __name__ == "__main__":
+    generate_images()
+\end{minted}
